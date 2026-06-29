@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RTSP Surveillance</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #111; color: #ddd; font-family: -apple-system, sans-serif; }
+
+header {
+  background: #1a1a1a;
+  border-bottom: 1px solid #333;
+  padding: 12px 20px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+header h1 { font-size: 16px; font-weight: 600; color: #eee; }
+.badge {
+  background: #222; border: 1px solid #444;
+  border-radius: 12px; padding: 2px 10px;
+  font-size: 11px; color: #aaa;
+}
+.badge.online { border-color: #27ae60; color: #2ecc71; }
+
+.layout { display: flex; height: calc(100vh - 49px); }
+
+/* Griglia telecamere */
+.grid-area { flex: 1; overflow-y: auto; padding: 8px; }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(480px, 1fr));
+  gap: 8px;
+}
+.cam-tile {
+  background: #1a1a1a;
+  border: 2px solid #333;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.cam-tile.motion { border-color: #e74c3c; animation: flash 0.5s 3; }
+@keyframes flash { 0%,100% { border-color: #e74c3c; } 50% { border-color: #ff6b6b; } }
+
+.cam-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; background: #222;
+  font-size: 12px; font-weight: 600;
+}
+.cam-header .dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: #555;
+}
+.cam-header .dot.online { background: #2ecc71; }
+.cam-header .status { margin-left: auto; font-size: 10px; color: #777; font-weight:400; }
+
+.cam-img-wrap { position: relative; background: #000; aspect-ratio: 16/9; }
+.cam-img-wrap img {
+  width: 100%; height: 100%;
+  object-fit: contain; display: block;
+}
+.motion-badge {
+  position: absolute; top: 8px; left: 8px;
+  background: rgba(231,76,60,0.85);
+  color: #fff; font-size: 11px; font-weight: 600;
+  padding: 2px 8px; border-radius: 4px;
+  display: none;
+}
+.motion-badge.visible { display: block; }
+
+/* Log laterale */
+.log-panel {
+  width: 300px; min-width: 240px;
+  background: #161616;
+  border-left: 1px solid #2a2a2a;
+  display: flex; flex-direction: column;
+}
+.log-header {
+  padding: 10px 12px;
+  border-bottom: 1px solid #2a2a2a;
+  font-size: 12px; font-weight: 600; color: #eee;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.log-header button {
+  background: #2a2a2a; border: 1px solid #444; color: #aaa;
+  border-radius: 4px; padding: 2px 8px; font-size: 10px; cursor: pointer;
+}
+.log-header button:hover { background: #333; }
+#log-list {
+  flex: 1; overflow-y: auto; padding: 6px 0;
+  font-size: 10px; font-family: "SF Mono", Menlo, monospace;
+}
+.log-entry {
+  padding: 3px 12px; border-left: 3px solid transparent;
+  line-height: 1.5;
+}
+.log-entry.motion  { border-color: #e74c3c; }
+.log-entry.error   { border-color: #e67e22; color: #e67e22; }
+.log-entry.info    { border-color: #3498db; }
+.ts   { color: #555; margin-right: 4px; }
+.cam-lbl { color: #888; margin-right: 4px; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: #111; }
+::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>🔐 RTSP Surveillance</h1>
+  <span class="badge" id="conn-badge">Connessione...</span>
+  <span class="badge" id="cam-count">{{ cameras|length }} cam</span>
+  <span style="margin-left:auto; font-size:11px; color:#555;" id="clock"></span>
+</header>
+
+<div class="layout">
+  <div class="grid-area">
+    <div class="grid" id="grid">
+      {% for cam in cameras %}
+      <div class="cam-tile" id="tile-{{ cam.id }}">
+        <div class="cam-header">
+          <span class="dot" id="dot-{{ cam.id }}"></span>
+          <span>{{ cam.name }}</span>
+          <span class="status" id="status-{{ cam.id }}">—</span>
+        </div>
+        <div class="cam-img-wrap">
+          <img src="/stream/{{ cam.id }}" alt="{{ cam.name }}"
+               onerror="this.src='/static/offline.svg'"
+               id="img-{{ cam.id }}">
+          <div class="motion-badge" id="badge-{{ cam.id }}">● MOVIMENTO</div>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="log-panel">
+    <div class="log-header">
+      📋 Log eventi
+      <button onclick="clearLog()">Pulisci</button>
+    </div>
+    <div id="log-list"></div>
+  </div>
+</div>
+
+<script>
+const CAMERAS = {{ cameras | tojson }};
+const motionTimers = {};
+
+// ── Orologio ──────────────────────────────────────────────────────────
+function updateClock() {
+  document.getElementById('clock').textContent =
+    new Date().toLocaleTimeString('it-IT');
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ── SSE eventi ────────────────────────────────────────────────────────
+const badge = document.getElementById('conn-badge');
+const logList = document.getElementById('log-list');
+
+function appendLog(ev) {
+  const el = document.createElement('div');
+  el.className = `log-entry ${ev.level}`;
+  el.innerHTML = `<span class="ts">${ev.time}</span>`
+               + `<span class="cam-lbl">[${ev.cam}]</span>`
+               + `${ev.msg}`;
+  logList.prepend(el);
+  // Max 300 righe
+  while (logList.children.length > 300) logList.lastChild.remove();
+}
+
+function clearLog() { logList.innerHTML = ''; }
+
+function flashMotion(camId) {
+  const tile  = document.getElementById(`tile-${camId}`);
+  const badge = document.getElementById(`badge-${camId}`);
+  if (!tile) return;
+  tile.classList.add('motion');
+  badge.classList.add('visible');
+  clearTimeout(motionTimers[camId]);
+  motionTimers[camId] = setTimeout(() => {
+    tile.classList.remove('motion');
+    badge.classList.remove('visible');
+  }, 4000);
+}
+
+function connectSSE() {
+  const es = new EventSource('/events');
+  es.onopen = () => {
+    badge.textContent = 'Connesso';
+    badge.classList.add('online');
+  };
+  es.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    appendLog(ev);
+    if (ev.level === 'motion') {
+      // Trova cam_id dal nome
+      const cam = CAMERAS.find(c => c.name === ev.cam);
+      if (cam) flashMotion(cam.id);
+    }
+  };
+  es.onerror = () => {
+    badge.textContent = 'Disconnesso';
+    badge.classList.remove('online');
+    setTimeout(connectSSE, 3000);
+  };
+}
+connectSSE();
+
+// ── Stato telecamere (polling leggero) ───────────────────────────────
+async function pollStatus() {
+  try {
+    const r = await fetch('/api/cameras');
+    const cams = await r.json();
+    for (const cam of cams) {
+      const dot = document.getElementById(`dot-${cam.id}`);
+      const st  = document.getElementById(`status-${cam.id}`);
+      if (dot) dot.className = `dot ${cam.connected ? 'online' : ''}`;
+      if (st)  st.textContent = cam.connected
+        ? `${cam.zones} zona/e` : 'Disconnessa';
+    }
+  } catch(e) {}
+}
+setInterval(pollStatus, 5000);
+pollStatus();
+</script>
+</body>
+</html>
