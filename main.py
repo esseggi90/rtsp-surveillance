@@ -315,13 +315,13 @@ def camera_worker(state: CameraState):
                 blur_size   = zone.get("blur_size",   21)  # dimensione blur (dispari)
                 erode_iter  = zone.get("erode_iter",  0)   # iterazioni erosione pre-dilatazione
 
-                # Crea/ricrea background subtractor se i parametri sono cambiati
+                # Crea/ricrea background subtractor solo se parametri cambiano
                 bg_key = f"{zi}_{sensitivity}_{bg_history}"
                 if zi not in zone_bg or getattr(zone_bg[zi], '_key', '') != bg_key:
                     zone_bg[zi] = cv2.createBackgroundSubtractorMOG2(
                         bg_history, sensitivity, False)
                     zone_bg[zi]._key = bg_key  # type: ignore
-                    zone_consec[zi] = 0
+                    zone_consec[zi]  = 0
 
                 zmask = np.zeros((h,w), dtype=np.uint8)
                 poly  = np.array([[int(p[0]*w), int(p[1]*h)] for p in pts], np.int32)

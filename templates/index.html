@@ -281,9 +281,17 @@ async function openEditor(camId, camName) {
   selIdx=-1; wip=[];
   document.getElementById('modalTitle').textContent=`Zone – ${camName}`;
   document.getElementById('modal').classList.add('open');
+
+  // Pausa stream live mentre editor è aperto (evita freeze)
+  document.querySelectorAll('.cam-img-wrap img').forEach(img => {
+    img.dataset.src = img.src;
+    img.src = '';
+  });
+
   cvs=document.getElementById('zoneCanvas');
   ctx=cvs.getContext('2d');
   bg=new Image();
+  bg.crossOrigin='anonymous';
   bg.onload=()=>{ resizeCvs(); render(); };
   bg.onerror=()=>{ resizeCvs(); render(); };
   bg.src=`/api/snapshot/${camId}?t=${Date.now()}`;
@@ -302,6 +310,11 @@ function closeEditor() {
   cvs.removeEventListener('mousemove',onCvsMove);
   cvs.removeEventListener('contextmenu',onCvsRight);
   document.removeEventListener('keydown',onKey);
+
+  // Riprendi stream live
+  document.querySelectorAll('.cam-img-wrap img').forEach(img => {
+    if(img.dataset.src){ img.src = img.dataset.src; delete img.dataset.src; }
+  });
 }
 
 function resizeCvs() {
