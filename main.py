@@ -135,11 +135,18 @@ def get_yolo():
     with _yolo_lock:
         if _yolo_model is None:
             try:
+                import torch
+                # Fix PyTorch 2.6 weights_only default
+                if hasattr(torch.serialization, 'add_safe_globals'):
+                    try:
+                        from ultralytics.nn.tasks import DetectionModel
+                        torch.serialization.add_safe_globals([DetectionModel])
+                    except Exception:
+                        pass
                 from ultralytics import YOLO
                 import logging as _l
                 _l.getLogger("ultralytics").setLevel(_l.WARNING)
                 _yolo_model = YOLO("yolov8n.pt")
-                # warm-up
                 dummy = np.zeros((240, 320, 3), dtype=np.uint8)
                 _yolo_model(dummy, verbose=False, classes=[0])
                 _yolo_ready = True
@@ -366,15 +373,17 @@ def _save_snapshot(frame: np.ndarray, cam_id: int, zone_name: str):
 
 @app.on_event("startup")
 async def startup():
-    # Avvia thread per ogni camera abilitata
-    for cam in CONFIG.get("cameras", []):
+    for i, cam in enumerate(CONFIG.get("cameras", [])):
         if not cam.get("enabled", True):
             continue
         state = CameraState(cam)
         CAMERAS[cam["id"]] = state
-        t = threading.Thread(target=camera_worker, args=(state,), daemon=True)
+        # Delay tra avvio cam per non sovraccaricare il NVR
+        def start_worker(s, delay):
+            time.sleep(delay)
+            camera_worker(s)
+        t = threading.Thread(target=start_worker, args=(state, i * 3), daemon=True)
         t.start()
-    # Carica YOLO in background
     threading.Thread(target=get_yolo, daemon=True).start()
     log.info(f"Avviate {len(CAMERAS)} telecamere")
 
