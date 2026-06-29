@@ -243,6 +243,20 @@ def camera_worker(state: CameraState):
             frame_n += 1
             h, w = frame.shape[:2]
 
+            # Processa solo 1 frame su 5 (~6fps) per risparmiare CPU
+            if frame_n % 5 != 0:
+                # Encode comunque per aggiornare il feed
+                _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 40])
+                with state.frame_lock:
+                    state.last_frame = jpg.tobytes()
+                if is_file and interval > 0:
+                    next_t = last_t + interval
+                    now = time.time()
+                    if next_t > now:
+                        time.sleep(next_t - now)
+                    last_t = max(next_t, time.time())
+                continue
+
             # ── Motion detection per zona ──────────────────────────────
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (21, 21), 0)
@@ -340,8 +354,13 @@ def camera_worker(state: CameraState):
                             (x1, y1-6), cv2.FONT_HERSHEY_SIMPLEX,
                             0.5, (0,255,80), 2)
 
-            # ── Encode JPEG ────────────────────────────────────────────
-            _, jpg = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            # ── Encode JPEG a bassa risoluzione per Render ────────────
+            # Ridimensiona a 640x360 max per ridurre CPU/banda
+            th, tw = vis.shape[:2]
+            if tw > 640:
+                scale = 640 / tw
+                vis = cv2.resize(vis, (640, int(th * scale)))
+            _, jpg = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 55])
             with state.frame_lock:
                 state.last_frame     = jpg.tobytes()
                 state.last_frame_raw = frame.copy()
@@ -413,7 +432,7 @@ async def video_stream(cam_id: int):
             if jpg:
                 yield (b"--frame\r\n"
                        b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
-            await asyncio.sleep(0.04)  # ~25fps max
+            await asyncio.sleep(0.1)  # 10fps max → meno banda e CPU
 
     return StreamingResponse(
         generate(),
