@@ -221,6 +221,7 @@ CAMERAS: dict[int, CameraState] = {}
 def motion_analysis_worker(state: CameraState, buf: dict):
     """Thread separato: analizza i frame senza bloccare la live."""
     zone_bg: dict[int, cv2.BackgroundSubtractor] = {}
+    zone_bg_keys: dict[int, str] = {}   # chiavi separate (cv2 non accetta attrs custom)
     zone_cooldown_ts: dict[int, float] = {}
     zone_consec: dict[int, int] = {}
 
@@ -257,9 +258,9 @@ def motion_analysis_worker(state: CameraState, buf: dict):
             erode_iter  = zone.get("erode_iter",  0)
 
             bg_key = f"{zi}_{sensitivity}_{bg_history}"
-            if zi not in zone_bg or getattr(zone_bg[zi], '_key', '') != bg_key:
-                zone_bg[zi] = cv2.createBackgroundSubtractorMOG2(bg_history, sensitivity, False)
-                zone_bg[zi]._key = bg_key  # type: ignore
+            if zi not in zone_bg or zone_bg_keys.get(zi) != bg_key:
+                zone_bg[zi]      = cv2.createBackgroundSubtractorMOG2(bg_history, sensitivity, False)
+                zone_bg_keys[zi] = bg_key
                 zone_consec[zi]  = 0
 
             zmask = np.zeros((h, w), dtype=np.uint8)
