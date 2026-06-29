@@ -190,8 +190,11 @@ def camera_worker(state: CameraState):
         elif os.path.isfile(state.url):
             cap = cv2.VideoCapture(state.url)
         else:
+            # Forza TCP per stream RTSP remoti (più affidabile di UDP)
             cap = cv2.VideoCapture(state.url, cv2.CAP_FFMPEG)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+            # Imposta trasporto TCP via opzioni FFMPEG
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
         # Attendi connessione
         connected = False
