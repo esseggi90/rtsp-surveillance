@@ -2,230 +2,616 @@
 <html lang="it">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RTSP Surveillance</title>
 <style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body { background: #111; color: #ddd; font-family: -apple-system, sans-serif; }
-
-header {
-  background: #1a1a1a;
-  border-bottom: 1px solid #333;
-  padding: 12px 20px;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-header h1 { font-size: 16px; font-weight: 600; color: #eee; }
-.badge {
-  background: #222; border: 1px solid #444;
-  border-radius: 12px; padding: 2px 10px;
-  font-size: 11px; color: #aaa;
-}
-.badge.online { border-color: #27ae60; color: #2ecc71; }
-
-.layout { display: flex; height: calc(100vh - 49px); }
-
-/* Griglia telecamere */
-.grid-area { flex: 1; overflow-y: auto; padding: 8px; }
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(480px, 1fr));
-  gap: 8px;
-}
-.cam-tile {
-  background: #1a1a1a;
-  border: 2px solid #333;
-  border-radius: 6px;
-  overflow: hidden;
-}
-.cam-tile.motion { border-color: #e74c3c; animation: flash 0.5s 3; }
-@keyframes flash { 0%,100% { border-color: #e74c3c; } 50% { border-color: #ff6b6b; } }
-
-.cam-header {
-  display: flex; align-items: center; gap: 8px;
-  padding: 6px 10px; background: #222;
-  font-size: 12px; font-weight: 600;
-}
-.cam-header .dot {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: #555;
-}
-.cam-header .dot.online { background: #2ecc71; }
-.cam-header .status { margin-left: auto; font-size: 10px; color: #777; font-weight:400; }
-
-.cam-img-wrap { position: relative; background: #000; aspect-ratio: 16/9; }
-.cam-img-wrap img {
-  width: 100%; height: 100%;
-  object-fit: contain; display: block;
-}
-.motion-badge {
-  position: absolute; top: 8px; left: 8px;
-  background: rgba(231,76,60,0.85);
-  color: #fff; font-size: 11px; font-weight: 600;
-  padding: 2px 8px; border-radius: 4px;
-  display: none;
-}
-.motion-badge.visible { display: block; }
-
-/* Log laterale */
-.log-panel {
-  width: 300px; min-width: 240px;
-  background: #161616;
-  border-left: 1px solid #2a2a2a;
-  display: flex; flex-direction: column;
-}
-.log-header {
-  padding: 10px 12px;
-  border-bottom: 1px solid #2a2a2a;
-  font-size: 12px; font-weight: 600; color: #eee;
-  display: flex; align-items: center; justify-content: space-between;
-}
-.log-header button {
-  background: #2a2a2a; border: 1px solid #444; color: #aaa;
-  border-radius: 4px; padding: 2px 8px; font-size: 10px; cursor: pointer;
-}
-.log-header button:hover { background: #333; }
-#log-list {
-  flex: 1; overflow-y: auto; padding: 6px 0;
-  font-size: 10px; font-family: "SF Mono", Menlo, monospace;
-}
-.log-entry {
-  padding: 3px 12px; border-left: 3px solid transparent;
-  line-height: 1.5;
-}
-.log-entry.motion  { border-color: #e74c3c; }
-.log-entry.error   { border-color: #e67e22; color: #e67e22; }
-.log-entry.info    { border-color: #3498db; }
-.ts   { color: #555; margin-right: 4px; }
-.cam-lbl { color: #888; margin-right: 4px; }
-
-/* Scrollbar */
-::-webkit-scrollbar { width: 4px; }
-::-webkit-scrollbar-track { background: #111; }
-::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#111;color:#ddd;font-family:-apple-system,sans-serif;font-size:13px}
+header{background:#1a1a1a;border-bottom:1px solid #333;padding:10px 16px;
+  display:flex;align-items:center;gap:12px}
+header h1{font-size:15px;font-weight:600;color:#eee}
+.badge{background:#222;border:1px solid #444;border-radius:10px;
+  padding:2px 9px;font-size:10px;color:#aaa}
+.badge.online{border-color:#27ae60;color:#2ecc71}
+.layout{display:flex;height:calc(100vh - 45px)}
+.grid-area{flex:1;overflow-y:auto;padding:6px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(460px,1fr));gap:6px}
+.cam-tile{background:#1a1a1a;border:2px solid #333;border-radius:6px;overflow:hidden}
+.cam-tile.motion{border-color:#e74c3c}
+.cam-header{display:flex;align-items:center;gap:8px;padding:5px 10px;
+  background:#222;font-size:11px;font-weight:600}
+.dot{width:7px;height:7px;border-radius:50%;background:#555}
+.dot.online{background:#2ecc71}
+.cam-status{margin-left:auto;font-size:10px;color:#777;font-weight:400}
+.cam-img-wrap{position:relative;background:#000;aspect-ratio:16/9}
+.cam-img-wrap img{width:100%;height:100%;object-fit:contain;display:block}
+.motion-badge{position:absolute;top:6px;left:6px;background:rgba(231,76,60,.85);
+  color:#fff;font-size:10px;font-weight:600;padding:2px 7px;border-radius:3px;display:none}
+.motion-badge.visible{display:block}
+.cam-footer{display:flex;gap:6px;padding:5px 8px;background:#1e1e1e;align-items:center}
+.btn{background:#2a2a2a;border:1px solid #444;color:#ccc;border-radius:4px;
+  padding:3px 10px;font-size:10px;cursor:pointer}
+.btn:hover{background:#333;color:#fff}
+.btn.green{background:#27ae60;border-color:#27ae60;color:#fff}
+.btn.red{border-color:#e74c3c}
+.btn.red:hover{background:#e74c3c;color:#fff}
+.zone-count{margin-left:auto;font-size:10px;color:#666}
+/* Log */
+.log-panel{width:280px;min-width:220px;background:#161616;
+  border-left:1px solid #2a2a2a;display:flex;flex-direction:column}
+.log-header{padding:8px 12px;border-bottom:1px solid #2a2a2a;
+  font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:space-between}
+.log-header button{background:#2a2a2a;border:1px solid #444;color:#aaa;
+  border-radius:3px;padding:1px 7px;font-size:10px;cursor:pointer}
+#log-list{flex:1;overflow-y:auto;font-size:10px;font-family:"SF Mono",Menlo,monospace}
+.log-entry{padding:3px 10px;border-left:3px solid transparent;line-height:1.5}
+.log-entry.motion{border-color:#e74c3c}
+.log-entry.error{border-color:#e67e22;color:#e67e22}
+.log-entry.info{border-color:#3498db}
+.ts{color:#555;margin-right:4px}
+.cam-lbl{color:#888;margin-right:4px}
+/* Modal */
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);
+  z-index:100;align-items:center;justify-content:center}
+.overlay.open{display:flex}
+.modal{background:#1e1e1e;border:1px solid #444;border-radius:8px;
+  width:1100px;max-width:97vw;height:88vh;display:flex;flex-direction:column;overflow:hidden}
+.modal-hdr{padding:10px 16px;border-bottom:1px solid #333;
+  display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
+.modal-hdr h2{font-size:14px;color:#eee}
+.modal-body{display:flex;flex:1;overflow:hidden;min-height:0}
+/* Canvas area */
+.canvas-area{flex:1;position:relative;background:#000;display:flex;align-items:stretch}
+#zoneCanvas{display:block;width:100%;height:100%;cursor:crosshair}
+/* Side panels */
+.side{width:240px;background:#181818;border-left:1px solid #2a2a2a;
+  display:flex;flex-direction:column;overflow:hidden}
+.side-tabs{display:flex;border-bottom:1px solid #2a2a2a;flex-shrink:0}
+.tab-btn{flex:1;padding:7px;font-size:11px;text-align:center;cursor:pointer;
+  color:#888;border:none;background:transparent}
+.tab-btn.active{color:#eee;border-bottom:2px solid #3498db}
+.tab-pane{display:none;flex:1;overflow-y:auto;padding:10px;flex-direction:column;gap:8px}
+.tab-pane.active{display:flex}
+/* Zone list */
+.zone-item{background:#222;border:1px solid #333;border-radius:4px;
+  padding:6px 8px;font-size:11px;display:flex;align-items:center;gap:6px;cursor:pointer}
+.zone-item.selected{border-color:#3498db;background:#1a2a3a}
+.zone-dot{width:10px;height:10px;border-radius:2px;flex-shrink:0}
+.zone-name{flex:1;font-weight:600}
+/* Props */
+.field{display:flex;flex-direction:column;gap:3px;margin-bottom:6px}
+.field label{font-size:10px;color:#888}
+.field input[type=text],.field input[type=number],.field textarea{
+  background:#2a2a2a;border:1px solid #444;border-radius:3px;
+  padding:4px 7px;color:#eee;font-size:11px;width:100%}
+.field textarea{resize:vertical;min-height:50px}
+.field input[type=range]{width:100%;accent-color:#3498db}
+.field .val{font-size:10px;color:#3498db;text-align:right}
+.ck-row{display:flex;align-items:center;gap:6px;margin-bottom:4px;font-size:11px}
+.ck-row input{accent-color:#3498db}
+.section-title{font-size:10px;color:#666;font-weight:600;text-transform:uppercase;
+  letter-spacing:.05em;margin:8px 0 4px}
+.hint-box{background:#222;border:1px solid #333;border-radius:3px;
+  padding:6px 8px;font-size:10px;color:#777;line-height:1.6;margin-bottom:6px}
+.modal-footer{padding:8px 16px;border-top:1px solid #2a2a2a;
+  display:flex;gap:8px;justify-content:flex-end;flex-shrink:0}
+::-webkit-scrollbar{width:4px}
+::-webkit-scrollbar-track{background:#111}
+::-webkit-scrollbar-thumb{background:#333;border-radius:2px}
 </style>
 </head>
 <body>
-
 <header>
   <h1>🔐 RTSP Surveillance</h1>
   <span class="badge" id="conn-badge">Connessione...</span>
-  <span class="badge" id="cam-count">{{ cameras|length }} cam</span>
-  <span style="margin-left:auto; font-size:11px; color:#555;" id="clock"></span>
+  <span class="badge">{{ cameras|length }} cam</span>
+  <span style="margin-left:auto;font-size:10px;color:#555" id="clock"></span>
 </header>
-
 <div class="layout">
-  <div class="grid-area">
-    <div class="grid" id="grid">
-      {% for cam in cameras %}
-      <div class="cam-tile" id="tile-{{ cam.id }}">
-        <div class="cam-header">
-          <span class="dot" id="dot-{{ cam.id }}"></span>
-          <span>{{ cam.name }}</span>
-          <span class="status" id="status-{{ cam.id }}">—</span>
-        </div>
-        <div class="cam-img-wrap">
-          <img src="/stream/{{ cam.id }}" alt="{{ cam.name }}"
-               onerror="this.src='/static/offline.svg'"
-               id="img-{{ cam.id }}">
-          <div class="motion-badge" id="badge-{{ cam.id }}">● MOVIMENTO</div>
-        </div>
+  <div class="grid-area"><div class="grid" id="grid">
+    {% for cam in cameras %}
+    <div class="cam-tile" id="tile-{{ cam.id }}">
+      <div class="cam-header">
+        <span class="dot" id="dot-{{ cam.id }}"></span>
+        <span>{{ cam.name }}</span>
+        <span class="cam-status" id="status-{{ cam.id }}">—</span>
       </div>
-      {% endfor %}
+      <div class="cam-img-wrap">
+        <img src="/stream/{{ cam.id }}" alt="{{ cam.name }}" id="img-{{ cam.id }}">
+        <div class="motion-badge" id="badge-{{ cam.id }}">● MOVIMENTO</div>
+      </div>
+      <div class="cam-footer">
+        <button class="btn" onclick="openEditor({{ cam.id }},'{{ cam.name }}')">🔲 Zone</button>
+        <span class="zone-count" id="zcount-{{ cam.id }}">0 zone</span>
+      </div>
     </div>
-  </div>
-
+    {% endfor %}
+  </div></div>
   <div class="log-panel">
-    <div class="log-header">
-      📋 Log eventi
-      <button onclick="clearLog()">Pulisci</button>
+    <div class="log-header">📋 Log eventi
+      <button onclick="document.getElementById('log-list').innerHTML=''">Pulisci</button>
     </div>
     <div id="log-list"></div>
   </div>
 </div>
 
+<!-- Modal editor zone -->
+<div class="overlay" id="modal">
+  <div class="modal">
+    <div class="modal-hdr">
+      <h2 id="modalTitle">Zone</h2>
+      <button class="btn" onclick="closeEditor()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="canvas-area"><canvas id="zoneCanvas"></canvas></div>
+      <div class="side">
+        <div class="side-tabs">
+          <button class="tab-btn active" onclick="showTab('tab-zones',this)">Zone</button>
+          <button class="tab-btn" onclick="showTab('tab-props',this)">Proprietà</button>
+          <button class="tab-btn" onclick="showTab('tab-help',this)">?</button>
+        </div>
+        <div class="tab-pane active" id="tab-zones">
+          <button class="btn green" onclick="newZone()" style="width:100%;margin-bottom:4px">
+            ＋ Nuova zona
+          </button>
+          <div id="zoneList"></div>
+        </div>
+        <div class="tab-pane" id="tab-props">
+          <div id="propsPanel"><p style="color:#666;font-size:11px">Seleziona una zona dalla lista</p></div>
+        </div>
+        <div class="tab-pane" id="tab-help">
+          <div class="hint-box">
+            <b>Disegna zona:</b><br>
+            • Click → aggiungi punto<br>
+            • Doppio click → chiudi (min 3 pt)<br>
+            • ESC → annulla<br>
+            • R → reset tutto<br><br>
+            <b>Seleziona zona:</b><br>
+            • Click destro sul poligono<br>
+            • oppure dalla lista "Zone"<br><br>
+            Vai in "Proprietà" per configurare sensibilità, Telegram, escalation.
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn red" onclick="if(confirm('Reset tutte le zone?')){editZones=[];selIdx=-1;refreshList();render()}">🔄 Reset</button>
+      <button class="btn" onclick="closeEditor()">Annulla</button>
+      <button class="btn green" onclick="saveZones()">✅ Salva zone</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const CAMERAS = {{ cameras | tojson }};
+const COLORS  = ['#00c864','#3296ff','#ffb400','#dc3cdc','#ff5050','#00dcdc'];
 const motionTimers = {};
+const camZones = {};
 
 // ── Orologio ──────────────────────────────────────────────────────────
-function updateClock() {
-  document.getElementById('clock').textContent =
-    new Date().toLocaleTimeString('it-IT');
+setInterval(()=>{ document.getElementById('clock').textContent=new Date().toLocaleTimeString('it-IT'); },1000);
+
+// ── Tab ───────────────────────────────────────────────────────────────
+function showTab(id, btn) {
+  document.querySelectorAll('.tab-pane').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  btn.classList.add('active');
 }
-setInterval(updateClock, 1000);
-updateClock();
 
-// ── SSE eventi ────────────────────────────────────────────────────────
-const badge = document.getElementById('conn-badge');
-const logList = document.getElementById('log-list');
-
+// ── SSE ───────────────────────────────────────────────────────────────
+const connBadge = document.getElementById('conn-badge');
 function appendLog(ev) {
   const el = document.createElement('div');
   el.className = `log-entry ${ev.level}`;
-  el.innerHTML = `<span class="ts">${ev.time}</span>`
-               + `<span class="cam-lbl">[${ev.cam}]</span>`
-               + `${ev.msg}`;
-  logList.prepend(el);
-  // Max 300 righe
-  while (logList.children.length > 300) logList.lastChild.remove();
+  el.innerHTML = `<span class="ts">${ev.time}</span><span class="cam-lbl">[${ev.cam}]</span>${ev.msg}`;
+  const list = document.getElementById('log-list');
+  list.prepend(el);
+  while(list.children.length>300) list.lastChild.remove();
 }
-
-function clearLog() { logList.innerHTML = ''; }
-
 function flashMotion(camId) {
-  const tile  = document.getElementById(`tile-${camId}`);
-  const badge = document.getElementById(`badge-${camId}`);
-  if (!tile) return;
-  tile.classList.add('motion');
-  badge.classList.add('visible');
+  const tile=document.getElementById(`tile-${camId}`);
+  const badge=document.getElementById(`badge-${camId}`);
+  if(!tile) return;
+  tile.classList.add('motion'); badge.classList.add('visible');
   clearTimeout(motionTimers[camId]);
-  motionTimers[camId] = setTimeout(() => {
-    tile.classList.remove('motion');
-    badge.classList.remove('visible');
-  }, 4000);
+  motionTimers[camId]=setTimeout(()=>{ tile.classList.remove('motion'); badge.classList.remove('visible'); },4000);
 }
-
 function connectSSE() {
-  const es = new EventSource('/events');
-  es.onopen = () => {
-    badge.textContent = 'Connesso';
-    badge.classList.add('online');
+  const es=new EventSource('/events');
+  es.onopen=()=>{ connBadge.textContent='Connesso'; connBadge.classList.add('online'); };
+  es.onmessage=(e)=>{
+    const ev=JSON.parse(e.data); appendLog(ev);
+    if(ev.level==='motion'){ const c=CAMERAS.find(c=>c.name===ev.cam); if(c) flashMotion(c.id); }
   };
-  es.onmessage = (e) => {
-    const ev = JSON.parse(e.data);
-    appendLog(ev);
-    if (ev.level === 'motion') {
-      // Trova cam_id dal nome
-      const cam = CAMERAS.find(c => c.name === ev.cam);
-      if (cam) flashMotion(cam.id);
-    }
-  };
-  es.onerror = () => {
-    badge.textContent = 'Disconnesso';
-    badge.classList.remove('online');
-    setTimeout(connectSSE, 3000);
-  };
+  es.onerror=()=>{ connBadge.textContent='Disconnesso'; connBadge.classList.remove('online'); setTimeout(connectSSE,3000); };
 }
 connectSSE();
 
-// ── Stato telecamere (polling leggero) ───────────────────────────────
+// ── Polling stato ─────────────────────────────────────────────────────
 async function pollStatus() {
   try {
-    const r = await fetch('/api/cameras');
-    const cams = await r.json();
-    for (const cam of cams) {
-      const dot = document.getElementById(`dot-${cam.id}`);
-      const st  = document.getElementById(`status-${cam.id}`);
-      if (dot) dot.className = `dot ${cam.connected ? 'online' : ''}`;
-      if (st)  st.textContent = cam.connected
-        ? `${cam.zones} zona/e` : 'Disconnessa';
+    const cams=await(await fetch('/api/cameras')).json();
+    for(const cam of cams){
+      const dot=document.getElementById(`dot-${cam.id}`);
+      const st=document.getElementById(`status-${cam.id}`);
+      if(dot) dot.className=`dot ${cam.connected?'online':''}`;
+      if(st)  st.textContent=cam.connected?'':' Disconnessa';
     }
-  } catch(e) {}
+  } catch(e){}
 }
-setInterval(pollStatus, 5000);
-pollStatus();
+setInterval(pollStatus,5000); pollStatus();
+
+// ── Carica zone ───────────────────────────────────────────────────────
+async function loadAllZones() {
+  for(const cam of CAMERAS){
+    try {
+      const r=await fetch(`/api/cameras/${cam.id}/zones`);
+      if(!r.ok){ camZones[cam.id]=[]; continue; }
+      const d=await r.json();
+      camZones[cam.id]=Array.isArray(d)?d:[];
+      document.getElementById(`zcount-${cam.id}`).textContent=
+        camZones[cam.id].length>0?`${camZones[cam.id].length} zona/e`:'0 zone';
+    } catch(e){ camZones[cam.id]=[]; }
+  }
+}
+loadAllZones();
+
+// ══════════════════════════════════════════════════════════════════════
+//  Editor zone
+// ══════════════════════════════════════════════════════════════════════
+let editCamId=null, editZones=[], selIdx=-1, wip=[], mouseN=null;
+let cvs=null, ctx=null, bg=null;
+
+function defaultZone(n) {
+  return {
+    name:`Zona ${n}`, points:[], enabled:true,
+    sensitivity:25, min_area:500, cooldown:10,
+    min_frames:3, bg_history:500, blur_size:21, erode_iter:1,
+    detect_persons:false, person_conf:25,
+    actions:{ record:false, snapshot:false, beep:false, log:true,
+      telegram:{ enabled:false, bot_token:'', chat_id:'', send_photo:true } },
+    escalation:[]
+  };
+}
+
+async function openEditor(camId, camName) {
+  editCamId=camId;
+  editZones=JSON.parse(JSON.stringify(Array.isArray(camZones[camId])?camZones[camId]:[]));
+  selIdx=-1; wip=[];
+  document.getElementById('modalTitle').textContent=`Zone – ${camName}`;
+  document.getElementById('modal').classList.add('open');
+  cvs=document.getElementById('zoneCanvas');
+  ctx=cvs.getContext('2d');
+  bg=new Image();
+  bg.onload=()=>{ resizeCvs(); render(); };
+  bg.onerror=()=>{ resizeCvs(); render(); };
+  bg.src=`/api/snapshot/${camId}?t=${Date.now()}`;
+  cvs.addEventListener('click',onCvsClick);
+  cvs.addEventListener('dblclick',onCvsDbl);
+  cvs.addEventListener('mousemove',onCvsMove);
+  cvs.addEventListener('contextmenu',onCvsRight);
+  document.addEventListener('keydown',onKey);
+  refreshList();
+}
+
+function closeEditor() {
+  document.getElementById('modal').classList.remove('open');
+  cvs.removeEventListener('click',onCvsClick);
+  cvs.removeEventListener('dblclick',onCvsDbl);
+  cvs.removeEventListener('mousemove',onCvsMove);
+  cvs.removeEventListener('contextmenu',onCvsRight);
+  document.removeEventListener('keydown',onKey);
+}
+
+function resizeCvs() {
+  const wrap=document.querySelector('.canvas-area');
+  cvs.width=wrap.clientWidth||700; cvs.height=wrap.clientHeight||400;
+}
+
+function n2c(nx,ny){ return [nx*cvs.width, ny*cvs.height]; }
+function c2n(cx,cy){ return [cx/cvs.width, cy/cvs.height]; }
+
+function render() {
+  if(!cvs) return;
+  ctx.clearRect(0,0,cvs.width,cvs.height);
+  if(bg&&bg.complete&&bg.naturalWidth) ctx.drawImage(bg,0,0,cvs.width,cvs.height);
+  else { ctx.fillStyle='#222'; ctx.fillRect(0,0,cvs.width,cvs.height); }
+
+  editZones.forEach((z,i)=>{
+    const pts=z.points||[]; if(pts.length<3) return;
+    const col=COLORS[i%COLORS.length];
+    const sel=i===selIdx;
+    ctx.beginPath();
+    let [x0,y0]=n2c(pts[0][0],pts[0][1]); ctx.moveTo(x0,y0);
+    for(let j=1;j<pts.length;j++){ let [xj,yj]=n2c(pts[j][0],pts[j][1]); ctx.lineTo(xj,yj); }
+    ctx.closePath();
+    ctx.fillStyle=col+(sel?'55':'33');
+    ctx.strokeStyle=col; ctx.lineWidth=sel?3:2;
+    if(sel){ ctx.setLineDash([6,3]); } else ctx.setLineDash([]);
+    ctx.fill(); ctx.stroke(); ctx.setLineDash([]);
+    const cx=pts.reduce((s,p)=>s+p[0],0)/pts.length*cvs.width;
+    const cy=pts.reduce((s,p)=>s+p[1],0)/pts.length*cvs.height;
+    ctx.fillStyle='#fff'; ctx.font='bold 12px sans-serif';
+    ctx.fillText(z.name||`Zona ${i+1}`,cx-25,cy+5);
+    if(z.actions?.telegram?.enabled){ ctx.fillText('✈',cx+30,cy+5); }
+    if(!z.enabled){ ctx.fillStyle='rgba(0,0,0,.4)'; ctx.fill(); }
+  });
+
+  if(wip.length>0){
+    ctx.strokeStyle='#ff0'; ctx.lineWidth=2; ctx.setLineDash([4,3]);
+    ctx.beginPath();
+    let [wx0,wy0]=n2c(wip[0][0],wip[0][1]); ctx.moveTo(wx0,wy0);
+    for(let j=1;j<wip.length;j++){ let [wxj,wyj]=n2c(wip[j][0],wip[j][1]); ctx.lineTo(wxj,wyj); }
+    if(mouseN){ let [mx,my]=n2c(mouseN[0],mouseN[1]); ctx.lineTo(mx,my); }
+    ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle='#ff0';
+    wip.forEach(p=>{ let [px,py]=n2c(p[0],p[1]); ctx.beginPath(); ctx.arc(px,py,5,0,Math.PI*2); ctx.fill(); });
+    if(wip.length>=3){ ctx.fillStyle='rgba(180,255,180,.9)'; ctx.font='11px sans-serif'; ctx.fillText('Doppio click per chiudere',8,18); }
+  }
+}
+
+function onCvsClick(e){
+  if(e.detail>1) return;
+  const r=cvs.getBoundingClientRect();
+  wip.push(c2n(e.clientX-r.left, e.clientY-r.top));
+  render();
+}
+
+function onCvsDbl(e){
+  e.preventDefault();
+  if(wip.length>=3){
+    const n=editZones.length+1;
+    const name=prompt(`Nome zona:`,`Zona ${n}`)||`Zona ${n}`;
+    const z=defaultZone(n); z.name=name; z.points=[...wip];
+    editZones.push(z); selIdx=editZones.length-1; wip=[];
+    refreshList(); renderProps(); render();
+    showTab('tab-props', document.querySelectorAll('.tab-btn')[1]);
+  } else { wip=[]; render(); }
+}
+
+function onCvsRight(e){
+  e.preventDefault();
+  const r=cvs.getBoundingClientRect();
+  const [nx,ny]=c2n(e.clientX-r.left,e.clientY-r.top);
+  for(let i=0;i<editZones.length;i++){
+    const pts=editZones[i].points||[]; if(pts.length<3) continue;
+    if(pointInPoly(nx,ny,pts)){ selIdx=i; refreshList(); renderProps(); render();
+      showTab('tab-props',document.querySelectorAll('.tab-btn')[1]); return; }
+  }
+}
+
+function onCvsMove(e){
+  const r=cvs.getBoundingClientRect();
+  mouseN=c2n(e.clientX-r.left,e.clientY-r.top);
+  if(wip.length>0) render();
+}
+
+function onKey(e){
+  if(e.key==='Escape'){ wip=[]; render(); }
+  if(e.key==='r'||e.key==='R'){ editZones=[]; selIdx=-1; wip=[]; refreshList(); render(); }
+  if(e.key==='Delete'&&selIdx>=0){ editZones.splice(selIdx,1); selIdx=-1; refreshList(); render(); }
+}
+
+function pointInPoly(nx,ny,pts){
+  let inside=false, n=pts.length;
+  for(let i=0,j=n-1;i<n;j=i++){
+    const xi=pts[i][0],yi=pts[i][1],xj=pts[j][0],yj=pts[j][1];
+    if(((yi>ny)!==(yj>ny))&&(nx<(xj-xi)*(ny-yi)/(yj-yi)+xi)) inside=!inside;
+  }
+  return inside;
+}
+
+function newZone(){
+  const n=editZones.length+1;
+  const name=prompt('Nome zona:',`Zona ${n}`)||`Zona ${n}`;
+  const z=defaultZone(n); z.name=name;
+  editZones.push(z); selIdx=editZones.length-1;
+  refreshList(); renderProps();
+  showTab('tab-props',document.querySelectorAll('.tab-btn')[1]);
+}
+
+function selectZone(i){
+  selIdx=i; render(); renderProps();
+  showTab('tab-props',document.querySelectorAll('.tab-btn')[1]);
+}
+
+function refreshList(){
+  const list=document.getElementById('zoneList');
+  list.innerHTML='';
+  editZones.forEach((z,i)=>{
+    const col=COLORS[i%COLORS.length];
+    const el=document.createElement('div');
+    el.className='zone-item'+(i===selIdx?' selected':'');
+    el.innerHTML=`<span class="zone-dot" style="background:${col}"></span>
+      <span class="zone-name">${z.name}</span>
+      <span style="font-size:10px;color:#666">${z.enabled?'✅':'⬜'}</span>
+      <button class="btn red" style="padding:1px 5px" onclick="event.stopPropagation();editZones.splice(${i},1);if(selIdx===${i})selIdx=-1;refreshList();render()">✕</button>`;
+    el.onclick=()=>selectZone(i);
+    list.appendChild(el);
+  });
+}
+</script>
+
+<script>
+// ── Pannello proprietà zona ───────────────────────────────────────────
+function renderProps(){
+  const panel=document.getElementById('propsPanel');
+  if(selIdx<0||selIdx>=editZones.length){
+    panel.innerHTML='<p style="color:#666;font-size:11px">Seleziona una zona dalla lista</p>';
+    return;
+  }
+  const z=editZones[selIdx]; const i=selIdx;
+  panel.innerHTML=`
+  <div class="field">
+    <label>Nome zona</label>
+    <input type="text" id="p-name" value="${esc(z.name)}" oninput="syncProp('name',this.value)">
+  </div>
+  <div class="ck-row">
+    <input type="checkbox" id="p-enabled" ${z.enabled?'checked':''} onchange="syncProp('enabled',this.checked)">
+    <label for="p-enabled">Zona abilitata</label>
+  </div>
+
+  <div class="section-title">🎛 Rilevamento</div>
+  <div class="field">
+    <label>Sensibilità: <span class="val" id="v-sens">${z.sensitivity}</span></label>
+    <div class="hint-box" style="margin-bottom:4px">Bassa = molto sensibile (luci/ombre). Alta = solo movimenti decisi. Consigliato: 20-35 interni, 35-55 esterni.</div>
+    <input type="range" min="1" max="100" value="${z.sensitivity}" oninput="document.getElementById('v-sens').textContent=this.value;syncProp('sensitivity',+this.value)">
+  </div>
+  <div class="field">
+    <label>Area minima px²: <span class="val" id="v-area">${z.min_area}</span></label>
+    <div class="hint-box" style="margin-bottom:4px">100-300 = insetti/riflessi. 500-800 = persone. 2000+ = veicoli.</div>
+    <input type="range" min="50" max="10000" step="50" value="${z.min_area}" oninput="document.getElementById('v-area').textContent=this.value;syncProp('min_area',+this.value)">
+  </div>
+  <div class="field">
+    <label>Cooldown alert (sec): <span class="val" id="v-cool">${z.cooldown}</span></label>
+    <div class="hint-box" style="margin-bottom:4px">Pausa minima tra un alert e il successivo. 5-15s normale, 30-60s aree tranquille.</div>
+    <input type="range" min="1" max="120" value="${z.cooldown}" oninput="document.getElementById('v-cool').textContent=this.value;syncProp('cooldown',+this.value)">
+  </div>
+  <div class="section-title">🛡 Anti falsi positivi</div>
+  <div class="hint-box">Questi parametri riducono gli alert causati da fari, luci, riflessi, ombre.</div>
+  <div class="field">
+    <label>Frame consecutivi richiesti: <span class="val" id="v-mf">${z.min_frames||1}</span></label>
+    <div class="hint-box" style="margin-bottom:4px">Quanti frame di fila deve persistere il movimento. <b>1</b>=immediato. <b>3-5</b>=ignora lampi. <b>8+</b>=solo movimenti prolungati.</div>
+    <input type="range" min="1" max="20" value="${z.min_frames||1}" oninput="document.getElementById('v-mf').textContent=this.value;syncProp('min_frames',+this.value)">
+  </div>
+  <div class="field">
+    <label>Storia background: <span class="val" id="v-bgh">${z.bg_history||500}</span> frame</label>
+    <div class="hint-box" style="margin-bottom:4px"><b>Basso (100-300)</b>=si adatta ai cambi luce. <b>Alto (500-1000)</b>=sfondo stabile, meno falsi positivi da illuminazione variabile.</div>
+    <input type="range" min="50" max="1000" step="50" value="${z.bg_history||500}" oninput="document.getElementById('v-bgh').textContent=this.value;syncProp('bg_history',+this.value)">
+  </div>
+  <div class="field">
+    <label>Intensità blur: <span class="val" id="v-blur">${z.blur_size||21}</span></label>
+    <div class="hint-box" style="margin-bottom:4px"><b>Alto (31-51)</b>=elimina granularità e riflessi. <b>Basso (11-21)</b>=più preciso sui dettagli.</div>
+    <input type="range" min="5" max="51" step="2" value="${z.blur_size||21}" oninput="document.getElementById('v-blur').textContent=this.value;syncProp('blur_size',+this.value)">
+  </div>
+  <div class="field">
+    <label>Erosione pixel isolati: <span class="val" id="v-ero">${z.erode_iter||0}</span></label>
+    <div class="hint-box" style="margin-bottom:4px"><b>0</b>=off. <b>1-2</b>=elimina puntini da riflessi. <b>3+</b>=solo grandi movimenti.</div>
+    <input type="range" min="0" max="5" value="${z.erode_iter||0}" oninput="document.getElementById('v-ero').textContent=this.value;syncProp('erode_iter',+this.value)">
+  </div>
+
+  <div class="hint-box">YOLOv8 nano: conferma presenza umana prima dell'alert. Elimina falsi positivi da luci/ombre.</div>
+  <div class="ck-row">
+    <input type="checkbox" id="p-yolo" ${z.detect_persons?'checked':''} onchange="syncProp('detect_persons',this.checked)">
+    <label for="p-yolo">Attiva YOLO</label>
+  </div>
+  <div class="field">
+    <label>Confidenza YOLO: <span class="val" id="v-conf">${z.person_conf}</span>%</label>
+    <input type="range" min="10" max="90" value="${z.person_conf}" oninput="document.getElementById('v-conf').textContent=this.value;syncProp('person_conf',+this.value)">
+  </div>
+
+  <div class="section-title">⚡ Azioni</div>
+  <div class="ck-row">
+    <input type="checkbox" ${z.actions?.snapshot?'checked':''} onchange="syncAction('snapshot',this.checked)">
+    <label>📷 Salva snapshot</label>
+  </div>
+  <div class="ck-row">
+    <input type="checkbox" ${z.actions?.log?'checked':''} onchange="syncAction('log',this.checked)">
+    <label>📋 Log eventi</label>
+  </div>
+
+  <div class="section-title">✈ Telegram</div>
+  <div class="hint-box">Manda messaggio + foto sul tuo bot Telegram al rilevamento. Lascia vuoto per usare i valori globali (env TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).</div>
+  <div class="ck-row">
+    <input type="checkbox" id="p-tg" ${z.actions?.telegram?.enabled?'checked':''} onchange="syncTg('enabled',this.checked)">
+    <label for="p-tg">Abilita notifica Telegram</label>
+  </div>
+  <div class="field">
+    <label>Bot Token (opzionale)</label>
+    <input type="text" placeholder="usa env TELEGRAM_BOT_TOKEN" value="${esc(z.actions?.telegram?.bot_token||'')}" oninput="syncTg('bot_token',this.value)">
+  </div>
+  <div class="field">
+    <label>Chat ID (opzionale)</label>
+    <input type="text" placeholder="usa env TELEGRAM_CHAT_ID" value="${esc(z.actions?.telegram?.chat_id||'')}" oninput="syncTg('chat_id',this.value)">
+  </div>
+  <div class="ck-row">
+    <input type="checkbox" ${z.actions?.telegram?.send_photo!==false?'checked':''} onchange="syncTg('send_photo',this.checked)">
+    <label>Invia foto con il messaggio</label>
+  </div>
+
+  <div class="section-title">🚨 Escalation</div>
+  <div class="hint-box">Invia un alert speciale se più zone vengono attivate entro un certo tempo. Es: se "Ingresso" e "Cassa" scattano entro 60s → alert escalation.</div>
+  <div id="esc-list"></div>
+  <button class="btn" style="width:100%;margin-top:4px" onclick="addEscRule(${i})">＋ Aggiungi regola</button>
+  `;
+  renderEscRules(i);
+}
+
+function esc(s){ return String(s||'').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function syncProp(key,val){
+  if(selIdx<0) return;
+  editZones[selIdx][key]=val;
+  if(key==='name') refreshList();
+  if(key==='enabled') refreshList();
+}
+function syncAction(key,val){
+  if(selIdx<0) return;
+  if(!editZones[selIdx].actions) editZones[selIdx].actions={};
+  editZones[selIdx].actions[key]=val;
+}
+function syncTg(key,val){
+  if(selIdx<0) return;
+  if(!editZones[selIdx].actions) editZones[selIdx].actions={};
+  if(!editZones[selIdx].actions.telegram) editZones[selIdx].actions.telegram={};
+  editZones[selIdx].actions.telegram[key]=val;
+}
+
+function renderEscRules(zi){
+  const list=document.getElementById('esc-list');
+  if(!list) return;
+  const rules=editZones[zi].escalation||[];
+  list.innerHTML='';
+  rules.forEach((rule,ri)=>{
+    const el=document.createElement('div');
+    el.style.cssText='background:#222;border:1px solid #333;border-radius:4px;padding:6px;margin-bottom:6px;font-size:10px';
+    el.innerHTML=`
+      <div style="display:flex;justify-content:space-between;margin-bottom:4px">
+        <b>Regola ${ri+1}</b>
+        <button class="btn red" style="padding:1px 5px" onclick="delEscRule(${zi},${ri})">✕</button>
+      </div>
+      <div class="field"><label>Zone (separate da virgola)</label>
+        <input type="text" value="${esc((rule.zones||[]).join(','))}"
+          oninput="editZones[${zi}].escalation[${ri}].zones=this.value.split(',').map(s=>s.trim()).filter(Boolean)">
+      </div>
+      <div class="field"><label>Finestra temporale (sec)</label>
+        <input type="number" min="5" max="3600" value="${rule.window_sec||60}"
+          oninput="editZones[${zi}].escalation[${ri}].window_sec=+this.value">
+      </div>
+      <div class="field"><label>Messaggio alert</label>
+        <input type="text" value="${esc(rule.message||'')}"
+          oninput="editZones[${zi}].escalation[${ri}].message=this.value">
+      </div>`;
+    list.appendChild(el);
+  });
+}
+
+function addEscRule(zi){
+  if(!editZones[zi].escalation) editZones[zi].escalation=[];
+  editZones[zi].escalation.push({zones:[],window_sec:60,message:'🚨 Escalation rilevata!'});
+  renderEscRules(zi);
+}
+function delEscRule(zi,ri){
+  editZones[zi].escalation.splice(ri,1);
+  renderEscRules(zi);
+}
+
+async function saveZones(){
+  try {
+    const r=await fetch(`/api/cameras/${editCamId}/zones`,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(editZones)
+    });
+    const d=await r.json();
+    if(d.status==='ok'){
+      camZones[editCamId]=JSON.parse(JSON.stringify(editZones));
+      const n=editZones.length;
+      document.getElementById(`zcount-${editCamId}`).textContent=n>0?`${n} zona/e`:'0 zone';
+      closeEditor();
+    }
+  } catch(e){ alert('Errore: '+e); }
+}
 </script>
 </body>
 </html>

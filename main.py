@@ -1,12 +1,12 @@
 """
-RTSP Surveillance Web – Backend FastAPI
-Legge stream RTSP, fa motion detection + YOLO, serve:
-  - MJPEG stream per ogni camera
-  - SSE per eventi live (motion, persone)
-  - API REST per configurazione
-  - Dashboard HTML
-
-Configurazione via env var CAMERAS (JSON) o config.json
+RTSP Surveillance Web – FastAPI backend
+Env vars:
+  RTSP_HOST, RTSP_PASSWORD       → credenziali NVR
+  STREAM_FPS   (default 10)      → fps MJPEG verso browser
+  PROCESS_FPS  (default 6)       → fps analisi motion/YOLO
+  JPEG_QUALITY (default 60)      → qualità JPEG
+  TELEGRAM_BOT_TOKEN             → token bot Telegram (globale)
+  TELEGRAM_CHAT_ID               → chat_id Telegram (globale)
 """
 
 import os, json, time, threading, asyncio, logging
@@ -15,58 +15,133 @@ from typing import AsyncGenerator
 
 import cv2
 import numpy as np
+import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("surveillance")
 
-app = FastAPI(title="RTSP Surveillance")
-
-# ── Percorsi template/static ───────────────────────────────────────────
+app  = FastAPI(title="RTSP Surveillance")
 BASE = os.path.dirname(__file__)
-templates = Jinja2Templates(directory=os.path.join(BASE, "templates"))
-static_path = os.path.join(BASE, "static")
-if os.path.isdir(static_path):
-    app.mount("/static", StaticFiles(directory=static_path), name="static")
+templates  = Jinja2Templates(directory=os.path.join(BASE, "templates"))
+static_dir = os.path.join(BASE, "static")
+if os.path.isdir(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+# ── Env ───────────────────────────────────────────────────────────────
+STREAM_FPS         = int(os.environ.get("STREAM_FPS",    "10"))
+PROCESS_FPS        = int(os.environ.get("PROCESS_FPS",   "6"))
+JPEG_QUALITY       = int(os.environ.get("JPEG_QUALITY",  "60"))
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "")
 
 # ══════════════════════════════════════════════════════════════════════
 #  Config
 # ══════════════════════════════════════════════════════════════════════
 
 def load_config() -> dict:
-    # 1. env var CAMERAS → JSON array completo (override totale)
     env = os.environ.get("CAMERAS")
     if env:
         try:
             return {"cameras": json.loads(env)}
         except Exception:
             pass
-
-    # 2. config.json locale con sostituzione RTSP_HOST e RTSP_PASSWORD
-    cfg_path = os.path.join(BASE, "config.json")
-    if os.path.exists(cfg_path):
-        with open(cfg_path) as f:
+    cfg = os.path.join(BASE, "config.json")
+    if os.path.exists(cfg):
+        with open(cfg) as f:
             raw = f.read()
-        # Sostituisce i placeholder con le env var
-        host     = os.environ.get("RTSP_HOST",     "192.168.1.2")
-        password = os.environ.get("RTSP_PASSWORD", "88888888")
-        raw = raw.replace("RTSP_HOST", host).replace("RTSP_PASSWORD", password)
+        host = os.environ.get("RTSP_HOST",     "192.168.1.2")
+        pwd  = os.environ.get("RTSP_PASSWORD", "password")
+        raw  = raw.replace("RTSP_HOST", host).replace("RTSP_PASSWORD", pwd)
         return json.loads(raw)
+    return {"cameras": []}
 
-    # 3. default demo
-    return {"cameras": [
-        {"id": 1, "name": "Demo",
-         "url": "rtsp://wowzaec2demo.streamlock.net/vod/mp4:BigBuckBunny_115k.mp4",
-         "enabled": True, "motion_zones": []}
-    ]}
+def save_config(cfg: dict):
+    with open(os.path.join(BASE, "config.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
 
 CONFIG = load_config()
 
 # ══════════════════════════════════════════════════════════════════════
-#  Stato globale per camera
+#  Telegram
+# ══════════════════════════════════════════════════════════════════════
+
+def tg_send(text: str, photo: bytes | None = None,
+            bot_token: str = "", chat_id: str = ""):
+    tok = bot_token or TELEGRAM_BOT_TOKEN
+    cid = chat_id  or TELEGRAM_CHAT_ID
+    if not tok or not cid:
+        return
+    def _do():
+        try:
+            base = f"https://api.telegram.org/bot{tok}"
+            if photo:
+                httpx.post(f"{base}/sendPhoto",
+                    data={"chat_id": cid, "caption": text, "parse_mode": "HTML"},
+                    files={"photo": ("snap.jpg", photo, "image/jpeg")},
+                    timeout=10)
+            else:
+                httpx.post(f"{base}/sendMessage",
+                    json={"chat_id": cid, "text": text, "parse_mode": "HTML"},
+                    timeout=10)
+        except Exception as e:
+            log.warning(f"Telegram: {e}")
+    threading.Thread(target=_do, daemon=True).start()
+
+# ══════════════════════════════════════════════════════════════════════
+#  YOLO singleton
+# ══════════════════════════════════════════════════════════════════════
+
+_yolo = None
+_yolo_ready = False
+_yolo_lock  = threading.Lock()
+
+def get_yolo():
+    global _yolo, _yolo_ready
+    with _yolo_lock:
+        if _yolo is None:
+            try:
+                import torch
+                if hasattr(torch.serialization, "add_safe_globals"):
+                    try:
+                        from ultralytics.nn.tasks import DetectionModel
+                        torch.serialization.add_safe_globals([DetectionModel])
+                    except Exception:
+                        pass
+                import logging as _l
+                _l.getLogger("ultralytics").setLevel(_l.WARNING)
+                from ultralytics import YOLO
+                _yolo = YOLO("yolov8n.pt")
+                _yolo(np.zeros((240,320,3), dtype=np.uint8), verbose=False, classes=[0])
+                _yolo_ready = True
+                log.info("YOLOv8 pronto")
+            except Exception as e:
+                log.warning(f"YOLO non disponibile: {e}")
+    return _yolo if _yolo_ready else None
+
+def yolo_detect(frame: np.ndarray, conf: float) -> list[dict]:
+    model = get_yolo()
+    if not model:
+        return []
+    h, w = frame.shape[:2]
+    scale = min(640/w, 640/h, 1.0)
+    small = cv2.resize(frame, None, fx=scale, fy=scale) if scale < 1 else frame
+    with _yolo_lock:
+        res = model(small, verbose=False, classes=[0], conf=conf)
+    out = []
+    if res and res[0].boxes is not None:
+        for box in res[0].boxes:
+            x1,y1,x2,y2 = box.xyxy[0].tolist()
+            out.append({"bbox":[int(x1/scale),int(y1/scale),
+                                 int(x2/scale),int(y2/scale)],
+                        "conf": float(box.conf[0])})
+    return out
+
+# ══════════════════════════════════════════════════════════════════════
+#  Stato camera
 # ══════════════════════════════════════════════════════════════════════
 
 class CameraState:
@@ -77,335 +152,304 @@ class CameraState:
         self.zones   = cam.get("motion_zones", [])
         self.enabled = cam.get("enabled", True)
 
-        self.frame_lock  = threading.Lock()
-        self.last_frame: bytes | None = None          # JPEG bytes
-        self.last_frame_raw: np.ndarray | None = None # BGR numpy
+        self._frame_lock = threading.Lock()
+        self.last_frame: bytes | None = None
+        self.last_raw:   np.ndarray | None = None
 
-        self.events: list[dict] = []           # ultimi 200 eventi
-        self.event_lock = threading.Lock()
+        self._evt_lock = threading.Lock()
+        self.events: list[dict] = []
 
+        self._sse_lock   = threading.Lock()
         self._sse_queues: list[asyncio.Queue] = []
-        self._sse_lock = threading.Lock()
 
         self.connected = False
 
+        # Per escalation: zone attivate di recente {zone_name: timestamp}
+        self._zone_hits: dict[str, float] = {}
+        self._hits_lock = threading.Lock()
+
     def push_event(self, level: str, msg: str):
-        ev = {
-            "time":   datetime.now().strftime("%H:%M:%S"),
-            "cam":    self.name,
-            "level":  level,
-            "msg":    msg,
-        }
-        with self.event_lock:
+        ev = {"time": datetime.now().strftime("%H:%M:%S"),
+              "cam":  self.name, "level": level, "msg": msg}
+        with self._evt_lock:
             self.events.append(ev)
             if len(self.events) > 200:
                 self.events.pop(0)
-        # Notifica tutti i listener SSE
         with self._sse_lock:
             for q in self._sse_queues:
-                try:
-                    q.put_nowait(ev)
-                except Exception:
-                    pass
+                try: q.put_nowait(ev)
+                except Exception: pass
 
-    def add_sse_queue(self, q: asyncio.Queue):
+    def add_sse(self, q): 
+        with self._sse_lock: self._sse_queues.append(q)
+    def rm_sse(self, q):
         with self._sse_lock:
-            self._sse_queues.append(q)
+            try: self._sse_queues.remove(q)
+            except ValueError: pass
 
-    def remove_sse_queue(self, q: asyncio.Queue):
-        with self._sse_lock:
-            try:
-                self._sse_queues.remove(q)
-            except ValueError:
-                pass
+    def record_zone_hit(self, zone_name: str):
+        with self._hits_lock:
+            self._zone_hits[zone_name] = time.time()
+            # Rimuovi hit più vecchi di 5 minuti
+            cutoff = time.time() - 300
+            self._zone_hits = {k:v for k,v in self._zone_hits.items() if v > cutoff}
 
+    def check_escalation(self, escalation_cfg: list) -> str | None:
+        """
+        escalation_cfg: [{"zones":["Zona A","Zona B"],"window_sec":60,"message":"Alert escalation!"}]
+        Ritorna il messaggio se la sequenza è soddisfatta, altrimenti None.
+        """
+        if not escalation_cfg:
+            return None
+        now = time.time()
+        with self._hits_lock:
+            for rule in escalation_cfg:
+                req_zones  = rule.get("zones", [])
+                window     = rule.get("window_sec", 60)
+                msg        = rule.get("message", "🚨 Escalation rilevata!")
+                if all(self._zone_hits.get(z, 0) > now - window
+                       for z in req_zones):
+                    return msg
+        return None
 
 CAMERAS: dict[int, CameraState] = {}
 
 # ══════════════════════════════════════════════════════════════════════
-#  YOLO (lazy singleton)
-# ══════════════════════════════════════════════════════════════════════
-
-_yolo_model = None
-_yolo_lock  = threading.Lock()
-_yolo_ready = False
-
-def get_yolo():
-    global _yolo_model, _yolo_ready
-    with _yolo_lock:
-        if _yolo_model is None:
-            try:
-                import torch
-                # Fix PyTorch 2.6 weights_only default
-                if hasattr(torch.serialization, 'add_safe_globals'):
-                    try:
-                        from ultralytics.nn.tasks import DetectionModel
-                        torch.serialization.add_safe_globals([DetectionModel])
-                    except Exception:
-                        pass
-                from ultralytics import YOLO
-                import logging as _l
-                _l.getLogger("ultralytics").setLevel(_l.WARNING)
-                _yolo_model = YOLO("yolov8n.pt")
-                dummy = np.zeros((240, 320, 3), dtype=np.uint8)
-                _yolo_model(dummy, verbose=False, classes=[0])
-                _yolo_ready = True
-                log.info("YOLOv8 pronto")
-            except Exception as e:
-                log.warning(f"YOLO non disponibile: {e}")
-        return _yolo_model if _yolo_ready else None
-
-def yolo_detect(frame: np.ndarray, conf: float = 0.25) -> list[dict]:
-    model = get_yolo()
-    if model is None:
-        return []
-    h, w = frame.shape[:2]
-    scale = min(640/w, 640/h, 1.0)
-    small = cv2.resize(frame, None, fx=scale, fy=scale) if scale < 1.0 else frame
-    with _yolo_lock:
-        results = model(small, verbose=False, classes=[0], conf=conf)
-    out = []
-    if results and results[0].boxes is not None:
-        for box in results[0].boxes:
-            x1,y1,x2,y2 = box.xyxy[0].tolist()
-            out.append({
-                "bbox": [int(x1/scale), int(y1/scale),
-                         int(x2/scale), int(y2/scale)],
-                "conf": float(box.conf[0])
-            })
-    return out
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Worker per ogni camera
+#  Worker camera
 # ══════════════════════════════════════════════════════════════════════
 
 def camera_worker(state: CameraState):
-    """Thread dedicato per una telecamera."""
-    retry_delay = 5
-    bg_sub = cv2.createBackgroundSubtractorMOG2(
-        history=500, varThreshold=25, detectShadows=False)
-    zone_last_alert: dict[int, float] = {}
+    retry = 5
+    # bg_history per zona: ricreato quando la zona cambia parametri
+    zone_bg: dict[int, cv2.BackgroundSubtractor] = {}
+    zone_cooldown_ts: dict[int, float] = {}
+    # Contatori frame consecutivi con movimento per zona
+    zone_consec: dict[int, int] = {}
 
     while True:
         state.connected = False
         state.push_event("info", "Connessione in corso...")
 
-        # Apri capture
-        if state.url.isdigit():
-            cap = cv2.VideoCapture(int(state.url))
-        elif os.path.isfile(state.url):
-            cap = cv2.VideoCapture(state.url)
+        url = state.url
+        if url.isdigit():
+            cap = cv2.VideoCapture(int(url))
+        elif os.path.isfile(url):
+            cap = cv2.VideoCapture(url)
         else:
-            # Forza TCP per stream RTSP remoti (più affidabile di UDP)
-            cap = cv2.VideoCapture(state.url, cv2.CAP_FFMPEG)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-            # Imposta trasporto TCP via opzioni FFMPEG
             os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+            cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
 
-        # Attendi connessione
-        connected = False
+        ok = False
         for _ in range(16):
             if cap.isOpened():
-                ret, _ = cap.read()
-                if ret:
-                    connected = True
-                    break
+                r, _ = cap.read()
+                if r: ok = True; break
             time.sleep(0.5)
 
-        if not connected:
+        if not ok:
             cap.release()
             state.push_event("error", "Connessione fallita, riprovo...")
-            time.sleep(retry_delay)
+            time.sleep(retry)
             continue
 
         state.connected = True
         state.push_event("info", "Connesso")
-        log.info(f"[Cam {state.id}] Connessa: {state.url}")
+        log.info(f"[Cam {state.id}] {url}")
 
-        is_file = os.path.isfile(state.url)
-        src_fps = cap.get(cv2.CAP_PROP_FPS) or 25
-        interval = 1.0 / src_fps if is_file else 0
-        last_t = time.time()
-        frame_n = 0
+        is_file    = os.path.isfile(url)
+        src_fps    = cap.get(cv2.CAP_PROP_FPS) or 25
+        interval   = 1.0 / src_fps if is_file else 0
+        last_t     = time.time()
+        frame_n    = 0
+        proc_every = max(1, int(src_fps / PROCESS_FPS))
+        # Reset contatori al riavvio
+        zone_consec.clear()
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 if is_file:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    bg_sub = cv2.createBackgroundSubtractorMOG2(
-                        history=500, varThreshold=25, detectShadows=False)
-                    last_t = time.time()
-                    continue
+                    zone_bg.clear()
+                    zone_consec.clear()
+                    last_t = time.time(); continue
                 break
 
             frame_n += 1
             h, w = frame.shape[:2]
 
-            # Processa solo 1 frame su 5 (~6fps) per risparmiare CPU
-            if frame_n % 5 != 0:
-                # Encode comunque per aggiornare il feed
-                _, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 40])
-                with state.frame_lock:
+            # Encode rapido per frame non processati
+            if frame_n % proc_every != 0:
+                _, jpg = cv2.imencode(".jpg", frame,
+                                      [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY-20])
+                with state._frame_lock:
                     state.last_frame = jpg.tobytes()
-                if is_file and interval > 0:
-                    next_t = last_t + interval
-                    now = time.time()
-                    if next_t > now:
-                        time.sleep(next_t - now)
-                    last_t = max(next_t, time.time())
+                    state.last_raw   = frame
+                if is_file and interval:
+                    nt = last_t + interval
+                    sl = nt - time.time()
+                    if sl > 0: time.sleep(sl)
+                    last_t = max(nt, time.time())
                 continue
 
-            # ── Motion detection per zona ──────────────────────────────
+            # ── Analisi frame ──────────────────────────────────────────
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (21, 21), 0)
-
-            person_boxes: list[dict] = []
+            gray = cv2.GaussianBlur(gray, (21,21), 0)
+            vis  = frame.copy()
 
             for zi, zone in enumerate(state.zones):
-                if not zone.get("enabled", True):
-                    continue
+                if not zone.get("enabled", True): continue
                 pts = zone.get("points", [])
-                if len(pts) < 3:
-                    continue
+                if len(pts) < 3: continue
 
-                min_area  = zone.get("min_area", 500)
-                cooldown  = zone.get("cooldown", 10)
-                use_yolo  = zone.get("detect_persons", False)
-                yolo_conf = zone.get("person_conf", 25) / 100.0
-                actions   = zone.get("actions", {})
+                min_area   = zone.get("min_area",     500)
+                cooldown   = zone.get("cooldown",     10)
+                use_yolo   = zone.get("detect_persons", False)
+                yolo_conf  = zone.get("person_conf",  25) / 100.0
+                actions    = zone.get("actions", {})
+                zname      = zone.get("name", f"Zona {zi+1}")
+                sensitivity = zone.get("sensitivity", 25)
+                bg_history  = zone.get("bg_history",  500)
+                min_frames  = zone.get("min_frames",  1)   # frame consecutivi richiesti
+                blur_size   = zone.get("blur_size",   21)  # dimensione blur (dispari)
+                erode_iter  = zone.get("erode_iter",  0)   # iterazioni erosione pre-dilatazione
 
-                zmask = np.zeros((h, w), dtype=np.uint8)
-                poly  = np.array([[int(p[0]*w), int(p[1]*h)] for p in pts],
-                                 dtype=np.int32)
+                # Crea/ricrea background subtractor se i parametri sono cambiati
+                bg_key = f"{zi}_{sensitivity}_{bg_history}"
+                if zi not in zone_bg or getattr(zone_bg[zi], '_key', '') != bg_key:
+                    zone_bg[zi] = cv2.createBackgroundSubtractorMOG2(
+                        bg_history, sensitivity, False)
+                    zone_bg[zi]._key = bg_key  # type: ignore
+                    zone_consec[zi] = 0
+
+                zmask = np.zeros((h,w), dtype=np.uint8)
+                poly  = np.array([[int(p[0]*w), int(p[1]*h)] for p in pts], np.int32)
                 cv2.fillPoly(zmask, [poly], 255)
 
-                gm   = cv2.bitwise_and(gray, gray, mask=zmask)
-                diff = bg_sub.apply(gm)
+                # Blur adattivo (blur_size deve essere dispari)
+                bsz = blur_size | 1
+                gm   = cv2.GaussianBlur(gray, (bsz, bsz), 0)
+                gm   = cv2.bitwise_and(gm, gm, mask=zmask)
+
+                diff = zone_bg[zi].apply(gm)
+
+                # Erosione per rimuovere pixel isolati (riflessi/granularità)
+                if erode_iter > 0:
+                    diff = cv2.erode(diff, None, iterations=erode_iter)
                 diff = cv2.dilate(diff, None, iterations=2)
                 diff = cv2.bitwise_and(diff, diff, mask=zmask)
 
-                cnts, _ = cv2.findContours(
-                    diff, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                max_area = max((cv2.contourArea(c) for c in cnts), default=0)
+                cnts,_ = cv2.findContours(diff, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                max_a  = max((cv2.contourArea(c) for c in cnts), default=0)
 
-                if max_area < min_area:
+                if max_a >= min_area:
+                    zone_consec[zi] = zone_consec.get(zi, 0) + 1
+                else:
+                    zone_consec[zi] = 0
+
+                # Richiedi N frame consecutivi prima di scattare l'alert
+                if zone_consec.get(zi, 0) < min_frames:
                     continue
 
-                # Filtro YOLO opzionale
+                # Filtro YOLO
+                person_boxes = []
                 if use_yolo:
                     boxes = yolo_detect(frame, yolo_conf)
-                    # Verifica che almeno una box sia nella zona
-                    in_zone = []
                     for b in boxes:
-                        cx_n = ((b["bbox"][0]+b["bbox"][2])/2) / w
-                        cy_n = ((b["bbox"][1]+b["bbox"][3])/2) / h
-                        poly_n = np.array([[p[0],p[1]] for p in pts],
-                                          dtype=np.float32)
-                        if cv2.pointPolygonTest(
-                                poly_n, (float(cx_n), float(cy_n)), False) >= 0:
-                            in_zone.append(b)
-                    if not in_zone:
-                        continue
-                    person_boxes.extend(in_zone)
+                        cx_n = (b["bbox"][0]+b["bbox"][2])/2/w
+                        cy_n = (b["bbox"][1]+b["bbox"][3])/2/h
+                        pn = np.array([[p[0],p[1]] for p in pts], np.float32)
+                        if cv2.pointPolygonTest(pn,(float(cx_n),float(cy_n)),False)>=0:
+                            person_boxes.append(b)
+                    if not person_boxes: continue
 
                 # Cooldown
                 now  = time.time()
-                last = zone_last_alert.get(zi, 0)
-                if now - last < cooldown:
-                    continue
-                zone_last_alert[zi] = now
+                last = zone_cooldown_ts.get(zi, 0)
+                if now - last < cooldown: continue
+                zone_cooldown_ts[zi] = now
 
-                zname  = zone.get("name", f"Zona {zi+1}")
-                prefix = "🚶 " if use_yolo else "🔴 "
-                state.push_event("motion", f"{prefix}[{zname}] Movimento rilevato")
+                # Log
+                ts   = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
+                pfx  = "🚶 " if use_yolo else "🔴 "
+                evmsg = f"{pfx}[{zname}] Movimento alle {ts}"
+                state.push_event("motion", evmsg)
 
-                # Azioni
+                # Snapshot JPEG
+                snap = None
+                _, jpgbuf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                snap = jpgbuf.tobytes()
+
+                # Salva snapshot su disco
                 if actions.get("snapshot"):
-                    _save_snapshot(frame, state.id, zname)
-                if actions.get("beep"):
-                    pass  # non disponibile server-side
-                if actions.get("log"):
-                    pass  # già loggato con push_event
+                    sdir = os.path.join(BASE, "snapshots")
+                    os.makedirs(sdir, exist_ok=True)
+                    fname = f"cam{state.id}_{zname}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                    with open(os.path.join(sdir, fname), "wb") as f:
+                        f.write(snap)
 
-            # ── Disegna overlay sul frame ──────────────────────────────
-            vis = frame.copy()
-            for zi, zone in enumerate(state.zones):
-                pts = zone.get("points", [])
-                if len(pts) >= 3:
-                    poly = np.array([[int(p[0]*w), int(p[1]*h)] for p in pts],
-                                    dtype=np.int32)
-                    color = (0, 200, 100) if zone.get("enabled", True) else (80, 80, 80)
-                    overlay = vis.copy()
-                    cv2.fillPoly(overlay, [poly], color)
-                    cv2.addWeighted(overlay, 0.25, vis, 0.75, 0, vis)
-                    cv2.polylines(vis, [poly], True, color, 2)
-                    cx = int(np.mean([p[0] for p in pts]) * w)
-                    cy = int(np.mean([p[1] for p in pts]) * h)
-                    cv2.putText(vis, zone.get("name", f"Z{zi+1}"),
-                                (cx-20, cy), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.55, (255,255,255), 2)
+                # Telegram per questa zona
+                tg_cfg = actions.get("telegram", {})
+                if tg_cfg.get("enabled"):
+                    tok = tg_cfg.get("bot_token") or TELEGRAM_BOT_TOKEN
+                    cid = tg_cfg.get("chat_id")   or TELEGRAM_CHAT_ID
+                    msg = (f"📷 <b>{state.name}</b>\n"
+                           f"🔴 <b>{zname}</b>\n"
+                           f"⏰ {ts}")
+                    tg_send(msg, snap if tg_cfg.get("send_photo", True) else None,
+                            tok, cid)
 
-            for b in person_boxes:
-                x1,y1,x2,y2 = b["bbox"]
-                cv2.rectangle(vis, (x1,y1), (x2,y2), (0,255,80), 2)
-                cv2.putText(vis, f"{b['conf']:.0%}",
-                            (x1, y1-6), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, (0,255,80), 2)
+                # Escalation
+                state.record_zone_hit(zname)
+                esc_rules = zone.get("escalation", [])
+                esc_msg   = state.check_escalation(esc_rules)
+                if esc_msg:
+                    state.push_event("motion", f"🚨 ESCALATION: {esc_msg}")
+                    tg_send(f"🚨 <b>ESCALATION</b> – {state.name}\n{esc_msg}\n⏰ {ts}",
+                            snap)
 
-            # ── Encode JPEG a bassa risoluzione per Render ────────────
-            # Ridimensiona a 640x360 max per ridurre CPU/banda
-            th, tw = vis.shape[:2]
-            if tw > 640:
-                scale = 640 / tw
-                vis = cv2.resize(vis, (640, int(th * scale)))
-            _, jpg = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 55])
-            with state.frame_lock:
-                state.last_frame     = jpg.tobytes()
-                state.last_frame_raw = frame.copy()
+                # Box YOLO sul frame
+                for b in person_boxes:
+                    x1,y1,x2,y2 = b["bbox"]
+                    cv2.rectangle(vis,(x1,y1),(x2,y2),(0,255,80),2)
+                    cv2.putText(vis,f"{b['conf']:.0%}",(x1,y1-6),
+                                cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,80),2)
 
-            # ── Throttle file locale ───────────────────────────────────
-            if is_file and interval > 0:
-                next_t = last_t + interval
-                now    = time.time()
-                if next_t > now:
-                    time.sleep(next_t - now)
-                last_t = max(next_t, time.time())
+            # ── Encode frame finale ────────────────────────────────────
+            if w > 640:
+                vis = cv2.resize(vis,(640, int(h*640/w)))
+            _, jpg = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+            with state._frame_lock:
+                state.last_frame = jpg.tobytes()
+                state.last_raw   = frame
+
+            if is_file and interval:
+                nt = last_t + interval
+                sl = nt - time.time()
+                if sl > 0: time.sleep(sl)
+                last_t = max(nt, time.time())
 
         cap.release()
         state.push_event("error", "Stream perso, riconnessione...")
-        time.sleep(retry_delay)
-
-
-def _save_snapshot(frame: np.ndarray, cam_id: int, zone_name: str):
-    snap_dir = os.path.join(BASE, "snapshots")
-    os.makedirs(snap_dir, exist_ok=True)
-    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(snap_dir, f"cam{cam_id}_{zone_name}_{ts}.jpg")
-    cv2.imwrite(path, frame)
-
+        time.sleep(retry)
 
 # ══════════════════════════════════════════════════════════════════════
-#  Startup / Shutdown
+#  Startup
 # ══════════════════════════════════════════════════════════════════════
 
 @app.on_event("startup")
 async def startup():
     for i, cam in enumerate(CONFIG.get("cameras", [])):
-        if not cam.get("enabled", True):
-            continue
+        if not cam.get("enabled", True): continue
         state = CameraState(cam)
         CAMERAS[cam["id"]] = state
-        # Delay tra avvio cam per non sovraccaricare il NVR
-        def start_worker(s, delay):
-            time.sleep(delay)
+        def _start(s, d):
+            time.sleep(d)
             camera_worker(s)
-        t = threading.Thread(target=start_worker, args=(state, i * 8), daemon=True)
-        t.start()
+        threading.Thread(target=_start, args=(state, i*8), daemon=True).start()
     threading.Thread(target=get_yolo, daemon=True).start()
-    log.info(f"Avviate {len(CAMERAS)} telecamere")
-
+    log.info(f"{len(CAMERAS)} telecamere avviate")
 
 # ══════════════════════════════════════════════════════════════════════
 #  Routes
@@ -415,99 +459,88 @@ async def startup():
 async def dashboard(request: Request):
     cams = [{"id": s.id, "name": s.name} for s in CAMERAS.values()]
     return templates.TemplateResponse(
-        "index.html", {"request": request, "cameras": cams})
+        request=request, name="index.html", context={"cameras": cams})
 
 
 @app.get("/stream/{cam_id}")
-async def video_stream(cam_id: int):
-    """MJPEG stream per una singola camera."""
+async def stream(cam_id: int):
     state = CAMERAS.get(cam_id)
     if not state:
-        return StreamingResponse(iter([]), media_type="text/plain")
-
-    async def generate():
+        return JSONResponse({"error": "not found"}, 404)
+    async def gen():
         while True:
-            with state.frame_lock:
+            with state._frame_lock:
                 jpg = state.last_frame
             if jpg:
-                yield (b"--frame\r\n"
-                       b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
-            await asyncio.sleep(0.1)  # 10fps max → meno banda e CPU
-
-    return StreamingResponse(
-        generate(),
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+            await asyncio.sleep(1.0 / STREAM_FPS)
+    return StreamingResponse(gen(),
         media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 @app.get("/events")
-async def sse_events(request: Request):
-    """Server-Sent Events: eventi da tutte le telecamere."""
-    q: asyncio.Queue = asyncio.Queue(maxsize=100)
-    for state in CAMERAS.values():
-        state.add_sse_queue(q)
-
-    async def generate() -> AsyncGenerator[str, None]:
-        # Manda gli ultimi 20 eventi storici
-        history = []
-        for state in CAMERAS.values():
-            with state.event_lock:
-                history.extend(state.events[-5:])
-        history.sort(key=lambda e: e["time"])
-        for ev in history:
+async def sse(request: Request):
+    q: asyncio.Queue = asyncio.Queue(100)
+    for s in CAMERAS.values(): s.add_sse(q)
+    async def gen() -> AsyncGenerator[str, None]:
+        hist = []
+        for s in CAMERAS.values():
+            with s._evt_lock: hist.extend(s.events[-5:])
+        for ev in sorted(hist, key=lambda e: e["time"]):
             yield f"data: {json.dumps(ev)}\n\n"
-
         try:
             while True:
-                if await request.is_disconnected():
-                    break
+                if await request.is_disconnected(): break
                 try:
-                    ev = await asyncio.wait_for(q.get(), timeout=15.0)
+                    ev = await asyncio.wait_for(q.get(), 15)
                     yield f"data: {json.dumps(ev)}\n\n"
                 except asyncio.TimeoutError:
                     yield ": ping\n\n"
         finally:
-            for state in CAMERAS.values():
-                state.remove_sse_queue(q)
-
-    return StreamingResponse(generate(), media_type="text/event-stream")
+            for s in CAMERAS.values(): s.rm_sse(q)
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.get("/api/cameras")
 async def api_cameras():
-    return [
-        {
-            "id":        s.id,
-            "name":      s.name,
-            "connected": s.connected,
-            "zones":     len(s.zones),
-        }
-        for s in CAMERAS.values()
-    ]
+    return [{"id": s.id, "name": s.name, "connected": s.connected,
+             "zones": len(s.zones)} for s in CAMERAS.values()]
+
+
+@app.get("/api/cameras/{cam_id}/zones")
+async def get_zones(cam_id: int):
+    s = CAMERAS.get(cam_id)
+    if not s: return JSONResponse({"error":"not found"}, 404)
+    return s.zones
+
+
+@app.post("/api/cameras/{cam_id}/zones")
+async def set_zones(cam_id: int, request: Request):
+    s = CAMERAS.get(cam_id)
+    if not s: return JSONResponse({"error":"not found"}, 404)
+    zones = await request.json()
+    s.zones = zones
+    for cam in CONFIG.get("cameras", []):
+        if cam["id"] == cam_id:
+            cam["motion_zones"] = zones; break
+    save_config(CONFIG)
+    log.info(f"[Cam {cam_id}] {len(zones)} zone salvate")
+    return {"status": "ok", "zones": len(zones)}
+
+
+@app.get("/api/snapshot/{cam_id}")
+async def snapshot(cam_id: int):
+    s = CAMERAS.get(cam_id)
+    if not s: return JSONResponse({"error":"not found"}, 404)
+    with s._frame_lock:
+        jpg = s.last_frame
+    if not jpg: return JSONResponse({"error":"no frame"}, 503)
+    return StreamingResponse(iter([jpg]), media_type="image/jpeg")
 
 
 @app.get("/api/events")
-async def api_events(limit: int = 50):
-    all_events = []
-    for state in CAMERAS.values():
-        with state.event_lock:
-            all_events.extend(state.events)
-    all_events.sort(key=lambda e: e["time"], reverse=True)
-    return all_events[:limit]
-
-
-@app.get("/api/config")
-async def api_config():
-    return CONFIG
-
-
-@app.post("/api/config")
-async def api_update_config(request: Request):
-    """Aggiorna configurazione (telecamere + zone) a runtime."""
-    global CONFIG
-    body = await request.json()
-    CONFIG = body
-    # Salva su disco
-    cfg_path = os.path.join(BASE, "config.json")
-    with open(cfg_path, "w") as f:
-        json.dump(CONFIG, f, indent=2)
-    return {"status": "ok", "message": "Riavvia il server per applicare le modifiche alle telecamere"}
+async def api_events(limit: int = 100):
+    all_ev = []
+    for s in CAMERAS.values():
+        with s._evt_lock: all_ev.extend(s.events)
+    return sorted(all_ev, key=lambda e: e["time"], reverse=True)[:limit]
