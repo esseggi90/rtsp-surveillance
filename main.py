@@ -401,7 +401,7 @@ async def startup():
         def start_worker(s, delay):
             time.sleep(delay)
             camera_worker(s)
-        t = threading.Thread(target=start_worker, args=(state, i * 3), daemon=True)
+        t = threading.Thread(target=start_worker, args=(state, i * 8), daemon=True)
         t.start()
     threading.Thread(target=get_yolo, daemon=True).start()
     log.info(f"Avviate {len(CAMERAS)} telecamere")
