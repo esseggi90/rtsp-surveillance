@@ -218,13 +218,124 @@ CAMERAS: dict[int, CameraState] = {}
 #  Worker camera
 # ══════════════════════════════════════════════════════════════════════
 
-def camera_worker(state: CameraState):
-    retry = 5
-    # bg_history per zona: ricreato quando la zona cambia parametri
+def motion_analysis_worker(state: CameraState, buf: dict):
+    """Thread separato: analizza i frame senza bloccare la live."""
     zone_bg: dict[int, cv2.BackgroundSubtractor] = {}
     zone_cooldown_ts: dict[int, float] = {}
-    # Contatori frame consecutivi con movimento per zona
     zone_consec: dict[int, int] = {}
+
+    while buf.get("active", True):
+        with buf["lock"]:
+            frame = buf.get("frame")
+            if frame is not None:
+                buf["frame"] = None
+        if frame is None:
+            time.sleep(0.05)
+            continue
+        if not state.zones:
+            time.sleep(0.1)
+            continue
+
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        for zi, zone in enumerate(state.zones):
+            if not zone.get("enabled", True): continue
+            pts = zone.get("points", [])
+            if len(pts) < 3: continue
+
+            min_area    = zone.get("min_area",    500)
+            cooldown    = zone.get("cooldown",    10)
+            use_yolo    = zone.get("detect_persons", False)
+            yolo_conf   = zone.get("person_conf", 25) / 100.0
+            actions     = zone.get("actions", {})
+            zname       = zone.get("name", f"Zona {zi+1}")
+            sensitivity = zone.get("sensitivity", 25)
+            bg_history  = zone.get("bg_history",  500)
+            min_frames  = zone.get("min_frames",  1)
+            blur_size   = zone.get("blur_size",   21)
+            erode_iter  = zone.get("erode_iter",  0)
+
+            bg_key = f"{zi}_{sensitivity}_{bg_history}"
+            if zi not in zone_bg or getattr(zone_bg[zi], '_key', '') != bg_key:
+                zone_bg[zi] = cv2.createBackgroundSubtractorMOG2(bg_history, sensitivity, False)
+                zone_bg[zi]._key = bg_key  # type: ignore
+                zone_consec[zi]  = 0
+
+            zmask = np.zeros((h, w), dtype=np.uint8)
+            poly  = np.array([[int(p[0]*w), int(p[1]*h)] for p in pts], np.int32)
+            cv2.fillPoly(zmask, [poly], 255)
+
+            bsz  = blur_size | 1
+            gm   = cv2.GaussianBlur(gray, (bsz, bsz), 0)
+            gm   = cv2.bitwise_and(gm, gm, mask=zmask)
+            diff = zone_bg[zi].apply(gm)
+            if erode_iter > 0:
+                diff = cv2.erode(diff, None, iterations=erode_iter)
+            diff = cv2.dilate(diff, None, iterations=2)
+            diff = cv2.bitwise_and(diff, diff, mask=zmask)
+
+            cnts, _ = cv2.findContours(diff, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            max_a   = max((cv2.contourArea(c) for c in cnts), default=0)
+
+            if max_a >= min_area:
+                zone_consec[zi] = zone_consec.get(zi, 0) + 1
+            else:
+                zone_consec[zi] = 0
+
+            if zone_consec.get(zi, 0) < min_frames:
+                continue
+
+            person_boxes = []
+            if use_yolo:
+                boxes = yolo_detect(frame, yolo_conf)
+                pn = np.array([[p[0], p[1]] for p in pts], np.float32)
+                for b in boxes:
+                    cx_n = (b["bbox"][0]+b["bbox"][2])/2/w
+                    cy_n = (b["bbox"][1]+b["bbox"][3])/2/h
+                    if cv2.pointPolygonTest(pn, (float(cx_n), float(cy_n)), False) >= 0:
+                        person_boxes.append(b)
+                if not person_boxes:
+                    continue
+
+            now  = time.time()
+            last = zone_cooldown_ts.get(zi, 0)
+            if now - last < cooldown:
+                continue
+            zone_cooldown_ts[zi] = now
+            zone_consec[zi]      = 0
+
+            ts    = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
+            pfx   = "🚶 " if use_yolo else "🔴 "
+            state.push_event("motion", f"{pfx}[{zname}] Movimento alle {ts}")
+
+            _, jpgbuf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            snap = jpgbuf.tobytes()
+
+            if actions.get("snapshot"):
+                sdir = os.path.join(BASE, "snapshots")
+                os.makedirs(sdir, exist_ok=True)
+                fname = f"cam{state.id}_{zname}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+                with open(os.path.join(sdir, fname), "wb") as f:
+                    f.write(snap)
+
+            tg_cfg = actions.get("telegram", {})
+            if tg_cfg.get("enabled"):
+                tok = tg_cfg.get("bot_token") or TELEGRAM_BOT_TOKEN
+                cid = tg_cfg.get("chat_id")   or TELEGRAM_CHAT_ID
+                msg = f"📷 <b>{state.name}</b>\n🔴 <b>{zname}</b>\n⏰ {ts}"
+                tg_send(msg, snap if tg_cfg.get("send_photo", True) else None, tok, cid)
+
+            state.record_zone_hit(zname)
+            esc_msg = state.check_escalation(zone.get("escalation", []))
+            if esc_msg:
+                state.push_event("motion", f"🚨 ESCALATION: {esc_msg}")
+                tg_send(f"🚨 <b>ESCALATION</b> – {state.name}\n{esc_msg}\n⏰ {ts}", snap)
+
+
+def camera_worker(state: CameraState):
+    """Thread principale: legge frame e pubblica SUBITO senza aspettare l'analisi."""
+    retry = 5
 
     while True:
         state.connected = False
@@ -257,172 +368,36 @@ def camera_worker(state: CameraState):
         state.push_event("info", "Connesso")
         log.info(f"[Cam {state.id}] {url}")
 
-        is_file    = os.path.isfile(url)
-        src_fps    = cap.get(cv2.CAP_PROP_FPS) or 25
-        interval   = 1.0 / src_fps if is_file else 0
-        last_t     = time.time()
-        frame_n    = 0
-        proc_every = max(1, int(src_fps / PROCESS_FPS))
-        # Reset contatori al riavvio
-        zone_consec.clear()
+        is_file  = os.path.isfile(url)
+        src_fps  = cap.get(cv2.CAP_PROP_FPS) or 25
+        interval = 1.0 / src_fps if is_file else 0
+        last_t   = time.time()
+
+        # Buffer condiviso con il thread di analisi
+        buf = {"frame": None, "lock": threading.Lock(), "active": True}
+        threading.Thread(target=motion_analysis_worker, args=(state, buf),
+                         daemon=True).start()
 
         while True:
             ret, frame = cap.read()
             if not ret:
                 if is_file:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    zone_bg.clear()
-                    zone_consec.clear()
-                    last_t = time.time(); continue
+                    last_t = time.time()
+                    continue
                 break
 
-            frame_n += 1
+            # Pubblica il frame SUBITO
             h, w = frame.shape[:2]
-
-            # Encode rapido per frame non processati
-            if frame_n % proc_every != 0:
-                _, jpg = cv2.imencode(".jpg", frame,
-                                      [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY-20])
-                with state._frame_lock:
-                    state.last_frame = jpg.tobytes()
-                    state.last_raw   = frame
-                if is_file and interval:
-                    nt = last_t + interval
-                    sl = nt - time.time()
-                    if sl > 0: time.sleep(sl)
-                    last_t = max(nt, time.time())
-                continue
-
-            # ── Analisi frame ──────────────────────────────────────────
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (21,21), 0)
-            vis  = frame.copy()
-
-            for zi, zone in enumerate(state.zones):
-                if not zone.get("enabled", True): continue
-                pts = zone.get("points", [])
-                if len(pts) < 3: continue
-
-                min_area   = zone.get("min_area",     500)
-                cooldown   = zone.get("cooldown",     10)
-                use_yolo   = zone.get("detect_persons", False)
-                yolo_conf  = zone.get("person_conf",  25) / 100.0
-                actions    = zone.get("actions", {})
-                zname      = zone.get("name", f"Zona {zi+1}")
-                sensitivity = zone.get("sensitivity", 25)
-                bg_history  = zone.get("bg_history",  500)
-                min_frames  = zone.get("min_frames",  1)   # frame consecutivi richiesti
-                blur_size   = zone.get("blur_size",   21)  # dimensione blur (dispari)
-                erode_iter  = zone.get("erode_iter",  0)   # iterazioni erosione pre-dilatazione
-
-                # Crea/ricrea background subtractor solo se parametri cambiano
-                bg_key = f"{zi}_{sensitivity}_{bg_history}"
-                if zi not in zone_bg or getattr(zone_bg[zi], '_key', '') != bg_key:
-                    zone_bg[zi] = cv2.createBackgroundSubtractorMOG2(
-                        bg_history, sensitivity, False)
-                    zone_bg[zi]._key = bg_key  # type: ignore
-                    zone_consec[zi]  = 0
-
-                zmask = np.zeros((h,w), dtype=np.uint8)
-                poly  = np.array([[int(p[0]*w), int(p[1]*h)] for p in pts], np.int32)
-                cv2.fillPoly(zmask, [poly], 255)
-
-                # Blur adattivo (blur_size deve essere dispari)
-                bsz = blur_size | 1
-                gm   = cv2.GaussianBlur(gray, (bsz, bsz), 0)
-                gm   = cv2.bitwise_and(gm, gm, mask=zmask)
-
-                diff = zone_bg[zi].apply(gm)
-
-                # Erosione per rimuovere pixel isolati (riflessi/granularità)
-                if erode_iter > 0:
-                    diff = cv2.erode(diff, None, iterations=erode_iter)
-                diff = cv2.dilate(diff, None, iterations=2)
-                diff = cv2.bitwise_and(diff, diff, mask=zmask)
-
-                cnts,_ = cv2.findContours(diff, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                max_a  = max((cv2.contourArea(c) for c in cnts), default=0)
-
-                if max_a >= min_area:
-                    zone_consec[zi] = zone_consec.get(zi, 0) + 1
-                else:
-                    zone_consec[zi] = 0
-
-                # Richiedi N frame consecutivi prima di scattare l'alert
-                if zone_consec.get(zi, 0) < min_frames:
-                    continue
-
-                # Filtro YOLO
-                person_boxes = []
-                if use_yolo:
-                    boxes = yolo_detect(frame, yolo_conf)
-                    for b in boxes:
-                        cx_n = (b["bbox"][0]+b["bbox"][2])/2/w
-                        cy_n = (b["bbox"][1]+b["bbox"][3])/2/h
-                        pn = np.array([[p[0],p[1]] for p in pts], np.float32)
-                        if cv2.pointPolygonTest(pn,(float(cx_n),float(cy_n)),False)>=0:
-                            person_boxes.append(b)
-                    if not person_boxes: continue
-
-                # Cooldown
-                now  = time.time()
-                last = zone_cooldown_ts.get(zi, 0)
-                if now - last < cooldown: continue
-                zone_cooldown_ts[zi] = now
-
-                # Log
-                ts   = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
-                pfx  = "🚶 " if use_yolo else "🔴 "
-                evmsg = f"{pfx}[{zname}] Movimento alle {ts}"
-                state.push_event("motion", evmsg)
-
-                # Snapshot JPEG
-                snap = None
-                _, jpgbuf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                snap = jpgbuf.tobytes()
-
-                # Salva snapshot su disco
-                if actions.get("snapshot"):
-                    sdir = os.path.join(BASE, "snapshots")
-                    os.makedirs(sdir, exist_ok=True)
-                    fname = f"cam{state.id}_{zname}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
-                    with open(os.path.join(sdir, fname), "wb") as f:
-                        f.write(snap)
-
-                # Telegram per questa zona
-                tg_cfg = actions.get("telegram", {})
-                if tg_cfg.get("enabled"):
-                    tok = tg_cfg.get("bot_token") or TELEGRAM_BOT_TOKEN
-                    cid = tg_cfg.get("chat_id")   or TELEGRAM_CHAT_ID
-                    msg = (f"📷 <b>{state.name}</b>\n"
-                           f"🔴 <b>{zname}</b>\n"
-                           f"⏰ {ts}")
-                    tg_send(msg, snap if tg_cfg.get("send_photo", True) else None,
-                            tok, cid)
-
-                # Escalation
-                state.record_zone_hit(zname)
-                esc_rules = zone.get("escalation", [])
-                esc_msg   = state.check_escalation(esc_rules)
-                if esc_msg:
-                    state.push_event("motion", f"🚨 ESCALATION: {esc_msg}")
-                    tg_send(f"🚨 <b>ESCALATION</b> – {state.name}\n{esc_msg}\n⏰ {ts}",
-                            snap)
-
-                # Box YOLO sul frame
-                for b in person_boxes:
-                    x1,y1,x2,y2 = b["bbox"]
-                    cv2.rectangle(vis,(x1,y1),(x2,y2),(0,255,80),2)
-                    cv2.putText(vis,f"{b['conf']:.0%}",(x1,y1-6),
-                                cv2.FONT_HERSHEY_SIMPLEX,0.5,(0,255,80),2)
-
-            # ── Encode frame finale ────────────────────────────────────
-            if w > 640:
-                vis = cv2.resize(vis,(640, int(h*640/w)))
-            _, jpg = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+            small = cv2.resize(frame, (640, int(h*640/w))) if w > 640 else frame
+            _, jpg = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
             with state._frame_lock:
                 state.last_frame = jpg.tobytes()
                 state.last_raw   = frame
+
+            # Passa al thread analisi (sovrascrive se non ancora consumato)
+            with buf["lock"]:
+                buf["frame"] = frame.copy()
 
             if is_file and interval:
                 nt = last_t + interval
@@ -430,6 +405,7 @@ def camera_worker(state: CameraState):
                 if sl > 0: time.sleep(sl)
                 last_t = max(nt, time.time())
 
+        buf["active"] = False
         cap.release()
         state.push_event("error", "Stream perso, riconnessione...")
         time.sleep(retry)
