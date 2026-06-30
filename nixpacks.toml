@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["libglib2-dev", "libsm6", "libxrender1", "libxext6", "libgl1-mesa-glx"]
+nixPkgs = ["libGL", "glib", "libxcb", "libSM", "libXrender", "libXext"]
 
 [phases.build]
 cmds = [
