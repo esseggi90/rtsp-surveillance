@@ -4,5 +4,4 @@ venv/
 .env
 snapshots/
 *.pt
-yolov8n.pt
 config.json

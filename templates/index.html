@@ -122,6 +122,7 @@ header h1{font-size:15px;font-weight:600;color:#eee}
       </div>
       <div class="cam-footer">
         <button class="btn" onclick="openEditor({{ cam.id }},'{{ cam.name }}')">🔲 Zone</button>
+        <button class="btn" onclick="openYolo({{ cam.id }},'{{ cam.name }}')">🤖 YOLO</button>
         <span class="zone-count" id="zcount-{{ cam.id }}">0 zone</span>
       </div>
     </div>
@@ -182,11 +183,73 @@ header h1{font-size:15px;font-weight:600;color:#eee}
   </div>
 </div>
 
+<!-- Modal YOLO camera -->
+<div class="overlay" id="yoloModal">
+  <div class="modal" style="width:520px;height:auto;max-height:90vh">
+    <div class="modal-hdr">
+      <h2 id="yoloModalTitle">YOLO</h2>
+      <button class="btn" onclick="closeYolo()">✕</button>
+    </div>
+    <div style="padding:14px;overflow-y:auto;max-height:70vh">
+      <div class="ck-row">
+        <input type="checkbox" id="yolo-enabled" onchange="yoloCfg.enabled=this.checked">
+        <label for="yolo-enabled"><b>Attiva YOLO su questa camera</b></label>
+      </div>
+      <div class="section-title">Entità da rilevare</div>
+      <div class="hint-box">Seleziona cosa cercare nel video. Le zone possono poi filtrare quali entità attivano l'alert.</div>
+      <div id="yolo-class-list" style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:8px"></div>
+      <div class="field">
+        <label>Modello</label>
+        <select id="yolo-model" onchange="yoloCfg.model=this.value" style="background:#2a2a2a;border:1px solid #444;border-radius:3px;padding:4px 7px;color:#eee;font-size:11px;width:100%">
+          <option value="yolo26n.pt">Nano – veloce</option>
+          <option value="yolo26s.pt">Small – consigliato</option>
+          <option value="yolo26m.pt">Medium – più preciso</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Image size: <span class="val" id="yolo-imgsz-val">640</span>px</label>
+        <div class="hint-box">YOLO26: image size 320 o 640 px. Tracking ByteTrack in background (non blocca la live).</div>
+        <select id="yolo-imgsz" onchange="yoloCfg.imgsz=+this.value;document.getElementById('yolo-imgsz-val').textContent=this.value"
+          style="background:#2a2a2a;border:1px solid #444;border-radius:3px;padding:4px 7px;color:#eee;font-size:11px;width:100%">
+          <option value="320">320 px – veloce</option>
+          <option value="640">640 px – consigliato</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>FPS analisi YOLO: <span class="val" id="yolo-fps-val">6</span></label>
+        <div class="hint-box">Analisi in background – la live resta fluida. 4-6 fps consigliato su Mac.</div>
+        <input type="range" id="yolo-fps" min="2" max="10" value="6"
+          oninput="document.getElementById('yolo-fps-val').textContent=this.value;yoloCfg.fps=+this.value">
+      </div>
+      <div class="field">
+        <label>Confidenza minima: <span class="val" id="yolo-conf-val">20</span>%</label>
+        <input type="range" id="yolo-conf" min="10" max="90" value="20"
+          oninput="document.getElementById('yolo-conf-val').textContent=this.value;yoloCfg.conf=+this.value">
+      </div>
+      <div class="section-title">Box evidenziazione</div>
+      <div class="ck-row">
+        <input type="checkbox" id="yolo-live" onchange="yoloCfg.show_boxes_live=this.checked">
+        <label for="yolo-live">Mostra box nella live</label>
+      </div>
+      <div class="ck-row">
+        <input type="checkbox" id="yolo-video" onchange="yoloCfg.show_boxes_video=this.checked">
+        <label for="yolo-video">Mostra box nei video Telegram</label>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn" onclick="closeYolo()">Annulla</button>
+      <button class="btn green" onclick="saveYolo()">✅ Salva</button>
+    </div>
+  </div>
+</div>
+
 <script>
 const CAMERAS = {{ cameras | tojson }};
 const COLORS  = ['#00c864','#3296ff','#ffb400','#dc3cdc','#ff5050','#00dcdc'];
+const YOLO_CLASSES = {0:'persona',1:'bicicletta',2:'auto',3:'moto',5:'bus',7:'camion',14:'uccello',15:'gatto',16:'cane'};
 const motionTimers = {};
 const camZones = {};
+let yoloCamId=null, yoloCfg={enabled:false,classes:[0,2],conf:20,imgsz:640,fps:6,model:'yolo26s.pt',show_boxes_live:false,show_boxes_video:true};
 
 // ── Orologio ──────────────────────────────────────────────────────────
 setInterval(()=>{ document.getElementById('clock').textContent=new Date().toLocaleTimeString('it-IT'); },1000);
@@ -257,6 +320,65 @@ async function loadAllZones() {
 }
 loadAllZones();
 
+// ── YOLO camera ───────────────────────────────────────────────────────
+function renderYoloClassList(){
+  const el=document.getElementById('yolo-class-list');
+  if(!el) return;
+  el.innerHTML='';
+  for(const [id,label] of Object.entries(YOLO_CLASSES)){
+    const cid=+id, checked=(yoloCfg.classes||[]).includes(cid);
+    const row=document.createElement('div');
+    row.className='ck-row';
+    row.innerHTML=`<input type="checkbox" id="ycls-${cid}" ${checked?'checked':''}>
+      <label for="ycls-${cid}">${label}</label>`;
+    row.querySelector('input').onchange=function(){
+      if(!yoloCfg.classes) yoloCfg.classes=[];
+      if(this.checked){ if(!yoloCfg.classes.includes(cid)) yoloCfg.classes.push(cid); }
+      else yoloCfg.classes=yoloCfg.classes.filter(c=>c!==cid);
+    };
+    el.appendChild(row);
+  }
+}
+
+async function openYolo(camId,camName){
+  yoloCamId=camId;
+  document.getElementById('yoloModalTitle').textContent=`YOLO – ${camName}`;
+  try{
+    const r=await fetch(`/api/cameras/${camId}/yolo`);
+    yoloCfg=await r.json();
+  }catch(e){
+    yoloCfg={enabled:false,classes:[0],conf:25,show_boxes_live:true,show_boxes_video:true};
+  }
+  if(!yoloCfg.classes||!yoloCfg.classes.length) yoloCfg.classes=[0,2];
+  document.getElementById('yolo-enabled').checked=!!yoloCfg.enabled;
+  document.getElementById('yolo-model').value=yoloCfg.model||'yolo26s.pt';
+  const imgsz=yoloCfg.imgsz>480?640:320;
+  yoloCfg.imgsz=imgsz;
+  document.getElementById('yolo-imgsz').value=String(imgsz);
+  document.getElementById('yolo-imgsz-val').textContent=String(imgsz);
+  document.getElementById('yolo-fps').value=yoloCfg.fps??6;
+  document.getElementById('yolo-fps-val').textContent=yoloCfg.fps??6;
+  document.getElementById('yolo-conf').value=yoloCfg.conf??20;
+  document.getElementById('yolo-conf-val').textContent=yoloCfg.conf??20;
+  document.getElementById('yolo-live').checked=yoloCfg.show_boxes_live===true;
+  document.getElementById('yolo-video').checked=yoloCfg.show_boxes_video!==false;
+  renderYoloClassList();
+  document.getElementById('yoloModal').classList.add('open');
+}
+
+function closeYolo(){ document.getElementById('yoloModal').classList.remove('open'); }
+
+async function saveYolo(){
+  try{
+    const r=await fetch(`/api/cameras/${yoloCamId}/yolo`,{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(yoloCfg)
+    });
+    const d=await r.json();
+    if(d.status==='ok') closeYolo();
+  }catch(e){ alert('Errore: '+e); }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 //  Editor zone
 // ══════════════════════════════════════════════════════════════════════
@@ -269,6 +391,7 @@ function defaultZone(n) {
     sensitivity:25, min_area:500, cooldown:10,
     min_frames:3, bg_history:500, blur_size:21, erode_iter:1,
     detect_persons:false, person_conf:25,
+    trigger_classes:[], yolo_only:false,
     actions:{ record:false, snapshot:false, beep:false, log:true,
       send_video:false, video_before_sec:10, video_after_sec:10,
       telegram:{ enabled:false, bot_token:'', chat_id:'', send_photo:true } },
@@ -505,14 +628,17 @@ function renderProps(){
     <input type="range" min="0" max="5" value="${z.erode_iter||0}" oninput="document.getElementById('v-ero').textContent=this.value;syncProp('erode_iter',+this.value)">
   </div>
 
-  <div class="hint-box">YOLOv8 nano: conferma presenza umana prima dell'alert. Elimina falsi positivi da luci/ombre.</div>
+  <div class="hint-box">YOLO: attivalo prima sulla camera (pulsante 🤖 YOLO). Poi scegli quali entità attivano questa zona.</div>
   <div class="ck-row">
-    <input type="checkbox" id="p-yolo" ${z.detect_persons?'checked':''} onchange="syncProp('detect_persons',this.checked)">
-    <label for="p-yolo">Attiva YOLO</label>
+    <input type="checkbox" id="p-yolo-only" ${z.yolo_only?'checked':''} onchange="syncProp('yolo_only',this.checked)">
+    <label for="p-yolo-only">Solo YOLO (ignora movimento generico)</label>
   </div>
+  <div class="section-title">Entità trigger zona</div>
+  <div class="hint-box">Se nessuna entità è selezionata, la zona usa solo il rilevamento movimento. Se selezioni entità, serve YOLO attivo sulla camera.</div>
+  <div id="trigger-class-list" style="display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:8px"></div>
   <div class="field">
-    <label>Confidenza YOLO: <span class="val" id="v-conf">${z.person_conf}</span>%</label>
-    <input type="range" min="10" max="90" value="${z.person_conf}" oninput="document.getElementById('v-conf').textContent=this.value;syncProp('person_conf',+this.value)">
+    <label>Confidenza YOLO zona: <span class="val" id="v-conf">${z.person_conf??25}</span>%</label>
+    <input type="range" min="10" max="90" value="${z.person_conf??25}" oninput="document.getElementById('v-conf').textContent=this.value;syncProp('person_conf',+this.value)">
   </div>
 
   <div class="section-title">⚡ Azioni</div>
@@ -566,6 +692,32 @@ function renderProps(){
   <button class="btn" style="width:100%;margin-top:4px" onclick="addEscRule(${i})">＋ Aggiungi regola</button>
   `;
   renderEscRules(i);
+  renderTriggerClasses(i);
+}
+
+function renderTriggerClasses(zi){
+  const el=document.getElementById('trigger-class-list');
+  if(!el) return;
+  const z=editZones[zi];
+  let tc=z.trigger_classes;
+  if(tc===undefined && z.detect_persons) tc=[0];
+  if(!tc) tc=[];
+  el.innerHTML='';
+  for(const [id,label] of Object.entries(YOLO_CLASSES)){
+    const cid=+id, checked=tc.includes(cid);
+    const row=document.createElement('div');
+    row.className='ck-row';
+    row.innerHTML=`<input type="checkbox" id="tcls-${zi}-${cid}" ${checked?'checked':''}>
+      <label for="tcls-${zi}-${cid}">${label}</label>`;
+    row.querySelector('input').onchange=function(){
+      if(!editZones[zi].trigger_classes) editZones[zi].trigger_classes=[];
+      const arr=editZones[zi].trigger_classes;
+      if(this.checked){ if(!arr.includes(cid)) arr.push(cid); }
+      else editZones[zi].trigger_classes=arr.filter(c=>c!==cid);
+      editZones[zi].detect_persons=editZones[zi].trigger_classes.includes(0);
+    };
+    el.appendChild(row);
+  }
 }
 
 function esc(s){ return String(s||'').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
