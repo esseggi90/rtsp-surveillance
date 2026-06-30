@@ -270,6 +270,7 @@ function defaultZone(n) {
     min_frames:3, bg_history:500, blur_size:21, erode_iter:1,
     detect_persons:false, person_conf:25,
     actions:{ record:false, snapshot:false, beep:false, log:true,
+      send_video:false, video_before_sec:10, video_after_sec:10,
       telegram:{ enabled:false, bot_token:'', chat_id:'', send_photo:true } },
     escalation:[]
   };
@@ -541,6 +542,22 @@ function renderProps(){
   <div class="ck-row">
     <input type="checkbox" ${z.actions?.telegram?.send_photo!==false?'checked':''} onchange="syncTg('send_photo',this.checked)">
     <label>Invia foto con il messaggio</label>
+  </div>
+  <div class="ck-row">
+    <input type="checkbox" ${z.actions?.send_video?'checked':''} onchange="syncAction('send_video',this.checked);document.getElementById('vid-opts').style.display=this.checked?'block':'none'">
+    <label>🎥 Invia video clip invece della foto</label>
+  </div>
+  <div id="vid-opts" style="display:${z.actions?.send_video?'block':'none'};padding-left:12px">
+    <div class="field">
+      <label>Secondi prima del rilevamento: <span class="val" id="v-vbef">${z.actions?.video_before_sec??10}</span>s</label>
+      <div class="hint-box" style="margin-bottom:4px">Frame registrati prima dell'evento. Il sistema mantiene un buffer circolare degli ultimi N secondi.</div>
+      <input type="range" min="0" max="30" value="${z.actions?.video_before_sec??10}" oninput="document.getElementById('v-vbef').textContent=this.value;syncAction('video_before_sec',+this.value)">
+    </div>
+    <div class="field">
+      <label>Secondi dopo il rilevamento: <span class="val" id="v-vaft">${z.actions?.video_after_sec??10}</span>s</label>
+      <div class="hint-box" style="margin-bottom:4px">Frame da registrare dopo l'evento prima di assemblare e inviare il video.</div>
+      <input type="range" min="1" max="60" value="${z.actions?.video_after_sec??10}" oninput="document.getElementById('v-vaft').textContent=this.value;syncAction('video_after_sec',+this.value)">
+    </div>
   </div>
 
   <div class="section-title">🚨 Escalation</div>

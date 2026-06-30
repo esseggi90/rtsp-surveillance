@@ -220,10 +220,15 @@ CAMERAS: dict[int, CameraState] = {}
 
 def motion_analysis_worker(state: CameraState, buf: dict):
     """Thread separato: analizza i frame senza bloccare la live."""
+    import collections, tempfile
     zone_bg: dict[int, cv2.BackgroundSubtractor] = {}
-    zone_bg_keys: dict[int, str] = {}   # chiavi separate (cv2 non accetta attrs custom)
+    zone_bg_keys: dict[int, str] = {}
     zone_cooldown_ts: dict[int, float] = {}
     zone_consec: dict[int, int] = {}
+    # Buffer circolare frame per pre-evento {zi: deque[(timestamp, frame)]}
+    zone_pre_buf: dict[int, collections.deque] = {}
+    # Stato post-evento {zi: {"frames": [], "target": int, "fps": float}}
+    zone_post: dict[int, dict] = {}
 
     while buf.get("active", True):
         with buf["lock"]:
@@ -239,6 +244,16 @@ def motion_analysis_worker(state: CameraState, buf: dict):
 
         h, w = frame.shape[:2]
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        now_t = time.time()
+
+        # Accumula post-evento se in corso
+        for zi, post in list(zone_post.items()):
+            post["frames"].append(frame.copy())
+            if len(post["frames"]) >= post["target"]:
+                # Clip completa → assembla e manda
+                _send_clip(state, zi, post["pre_frames"] + post["frames"],
+                           post["fps"], post["zone"])
+                del zone_post[zi]
 
         for zi, zone in enumerate(state.zones):
             if not zone.get("enabled", True): continue
@@ -256,6 +271,17 @@ def motion_analysis_worker(state: CameraState, buf: dict):
             min_frames  = zone.get("min_frames",  1)
             blur_size   = zone.get("blur_size",   21)
             erode_iter  = zone.get("erode_iter",  0)
+            # Parametri video clip
+            send_video    = actions.get("send_video", False)
+            vid_before    = actions.get("video_before_sec", 10)
+            vid_after     = actions.get("video_after_sec",  10)
+            analysis_fps  = PROCESS_FPS
+
+            # Mantieni buffer pre-evento
+            maxlen = max(1, int(vid_before * analysis_fps))
+            if zi not in zone_pre_buf:
+                zone_pre_buf[zi] = collections.deque(maxlen=maxlen)
+            zone_pre_buf[zi].append(frame.copy())
 
             bg_key = f"{zi}_{sensitivity}_{bg_history}"
             if zi not in zone_bg or zone_bg_keys.get(zi) != bg_key:
@@ -299,11 +325,10 @@ def motion_analysis_worker(state: CameraState, buf: dict):
                 if not person_boxes:
                     continue
 
-            now  = time.time()
             last = zone_cooldown_ts.get(zi, 0)
-            if now - last < cooldown:
+            if now_t - last < cooldown:
                 continue
-            zone_cooldown_ts[zi] = now
+            zone_cooldown_ts[zi] = now_t
             zone_consec[zi]      = 0
 
             ts    = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
@@ -325,13 +350,87 @@ def motion_analysis_worker(state: CameraState, buf: dict):
                 tok = tg_cfg.get("bot_token") or TELEGRAM_BOT_TOKEN
                 cid = tg_cfg.get("chat_id")   or TELEGRAM_CHAT_ID
                 msg = f"📷 <b>{state.name}</b>\n🔴 <b>{zname}</b>\n⏰ {ts}"
-                tg_send(msg, snap if tg_cfg.get("send_photo", True) else None, tok, cid)
+                # Foto immediata
+                if not send_video:
+                    tg_send(msg, snap if tg_cfg.get("send_photo", True) else None, tok, cid)
+                else:
+                    # Manda testo subito, video quando pronto
+                    tg_send(msg, None, tok, cid)
+                    # Avvia raccolta post-evento
+                    if zi not in zone_post:
+                        pre_frames = list(zone_pre_buf.get(zi, []))
+                        zone_post[zi] = {
+                            "frames":     [],
+                            "pre_frames": pre_frames,
+                            "target":     max(1, int(vid_after * analysis_fps)),
+                            "fps":        float(analysis_fps),
+                            "zone":       zone,
+                        }
 
             state.record_zone_hit(zname)
             esc_msg = state.check_escalation(zone.get("escalation", []))
             if esc_msg:
                 state.push_event("motion", f"🚨 ESCALATION: {esc_msg}")
                 tg_send(f"🚨 <b>ESCALATION</b> – {state.name}\n{esc_msg}\n⏰ {ts}", snap)
+
+
+def _send_clip(state: CameraState, zi: int, frames: list,
+               fps: float, zone: dict):
+    """Assembla i frame in MP4 e lo manda su Telegram."""
+    if not frames:
+        return
+    actions = zone.get("actions", {})
+    tg_cfg  = actions.get("telegram", {})
+    if not tg_cfg.get("enabled"):
+        return
+
+    tok = tg_cfg.get("bot_token") or TELEGRAM_BOT_TOKEN
+    cid = tg_cfg.get("chat_id")   or TELEGRAM_CHAT_ID
+    if not tok or not cid:
+        return
+
+    def _do():
+        import tempfile
+        try:
+            h, w = frames[0].shape[:2]
+            # Ridimensiona a max 640px lato
+            if w > 640:
+                scale = 640 / w
+                w2, h2 = 640, int(h * scale)
+            else:
+                w2, h2 = w, h
+
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                path = tmp.name
+
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out    = cv2.VideoWriter(path, fourcc, fps, (w2, h2))
+            for fr in frames:
+                if w > 640:
+                    fr = cv2.resize(fr, (w2, h2))
+                out.write(fr)
+            out.release()
+
+            zname = zone.get("name", f"Zona {zi+1}")
+            ts    = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
+            cap   = (f"🎥 <b>{state.name}</b> – <b>{zname}</b>\n"
+                     f"⏰ {ts}\n"
+                     f"⏱ {len(frames)/fps:.0f}s di clip")
+
+            with open(path, "rb") as f:
+                video_bytes = f.read()
+            os.unlink(path)
+
+            base = f"https://api.telegram.org/bot{tok}"
+            httpx.post(f"{base}/sendVideo",
+                       data={"chat_id": cid, "caption": cap,
+                             "parse_mode": "HTML", "supports_streaming": "true"},
+                       files={"video": ("clip.mp4", video_bytes, "video/mp4")},
+                       timeout=60)
+        except Exception as e:
+            log.warning(f"[Cam {state.id}] Clip Telegram error: {e}")
+
+    threading.Thread(target=_do, daemon=True).start()
 
 
 def camera_worker(state: CameraState):
