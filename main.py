@@ -220,14 +220,10 @@ CAMERAS: dict[int, CameraState] = {}
 
 def motion_analysis_worker(state: CameraState, buf: dict):
     """Thread separato: analizza i frame senza bloccare la live."""
-    import collections, tempfile
     zone_bg: dict[int, cv2.BackgroundSubtractor] = {}
     zone_bg_keys: dict[int, str] = {}
     zone_cooldown_ts: dict[int, float] = {}
     zone_consec: dict[int, int] = {}
-    # Buffer circolare frame per pre-evento {zi: deque[(timestamp, frame)]}
-    zone_pre_buf: dict[int, collections.deque] = {}
-    # Stato post-evento {zi: {"frames": [], "target": int, "fps": float}}
     zone_post: dict[int, dict] = {}
 
     while buf.get("active", True):
@@ -246,14 +242,15 @@ def motion_analysis_worker(state: CameraState, buf: dict):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         now_t = time.time()
 
-        # Accumula post-evento se in corso
-        for zi, post in list(zone_post.items()):
+        # Accumula post-evento se in corso (per tutte le zone attive)
+        for zi in list(zone_post.keys()):
+            post = zone_post[zi]
             post["frames"].append(frame.copy())
-            if len(post["frames"]) >= post["target"]:
-                # Clip completa → assembla e manda
-                _send_clip(state, zi, post["pre_frames"] + post["frames"],
-                           post["fps"], post["zone"])
+            if now_t >= post["until"]:
+                all_frames = post["pre_frames"] + post["frames"]
+                _send_clip(state, zi, all_frames, post["fps"], post["zone"])
                 del zone_post[zi]
+                log.info(f"[Cam {state.id}] Clip zona {zi} completata: {len(all_frames)} frame")
 
         for zi, zone in enumerate(state.zones):
             if not zone.get("enabled", True): continue
@@ -276,12 +273,6 @@ def motion_analysis_worker(state: CameraState, buf: dict):
             vid_before    = actions.get("video_before_sec", 10)
             vid_after     = actions.get("video_after_sec",  10)
             analysis_fps  = PROCESS_FPS
-
-            # Mantieni buffer pre-evento
-            maxlen = max(1, int(vid_before * analysis_fps))
-            if zi not in zone_pre_buf:
-                zone_pre_buf[zi] = collections.deque(maxlen=maxlen)
-            zone_pre_buf[zi].append(frame.copy())
 
             bg_key = f"{zi}_{sensitivity}_{bg_history}"
             if zi not in zone_bg or zone_bg_keys.get(zi) != bg_key:
@@ -328,6 +319,8 @@ def motion_analysis_worker(state: CameraState, buf: dict):
             last = zone_cooldown_ts.get(zi, 0)
             if now_t - last < cooldown:
                 continue
+            if send_video and zi in zone_post:
+                continue
             zone_cooldown_ts[zi] = now_t
             zone_consec[zi]      = 0
 
@@ -353,19 +346,18 @@ def motion_analysis_worker(state: CameraState, buf: dict):
                 # Foto immediata
                 if not send_video:
                     tg_send(msg, snap if tg_cfg.get("send_photo", True) else None, tok, cid)
-                else:
-                    # Manda testo subito, video quando pronto
-                    tg_send(msg, None, tok, cid)
-                    # Avvia raccolta post-evento
-                    if zi not in zone_post:
-                        pre_frames = list(zone_pre_buf.get(zi, []))
-                        zone_post[zi] = {
-                            "frames":     [],
-                            "pre_frames": pre_frames,
-                            "target":     max(1, int(vid_after * analysis_fps)),
-                            "fps":        float(analysis_fps),
-                            "zone":       zone,
-                        }
+                elif zi not in zone_post:
+                    cutoff = now_t - vid_before
+                    with buf["lock"]:
+                        pre_frames = [f for t, f in buf["clip_ring"] if t >= cutoff]
+                    zone_post[zi] = {
+                        "frames":     [],
+                        "pre_frames": pre_frames,
+                        "until":      now_t + vid_after,
+                        "fps":        float(analysis_fps),
+                        "zone":       zone,
+                    }
+                    log.info(f"[Cam {state.id}] Avvio clip zona {zi}: {len(pre_frames)} pre-frame, {vid_after}s post")
 
             state.record_zone_hit(zname)
             esc_msg = state.check_escalation(zone.get("escalation", []))
@@ -376,7 +368,7 @@ def motion_analysis_worker(state: CameraState, buf: dict):
 
 def _send_clip(state: CameraState, zi: int, frames: list,
                fps: float, zone: dict):
-    """Assembla i frame in MP4 e lo manda su Telegram."""
+    """Assembla i frame in MP4 H.264 via FFmpeg e manda su Telegram."""
     if not frames:
         return
     actions = zone.get("actions", {})
@@ -390,45 +382,79 @@ def _send_clip(state: CameraState, zi: int, frames: list,
         return
 
     def _do():
-        import tempfile
+        import subprocess, tempfile
+        out_path = None
         try:
             h, w = frames[0].shape[:2]
-            # Ridimensiona a max 640px lato
             if w > 640:
                 scale = 640 / w
-                w2, h2 = 640, int(h * scale)
+                w2 = 640
+                h2 = int(h * scale)
             else:
                 w2, h2 = w, h
+            w2 -= w2 % 2
+            h2 -= h2 % 2
 
-            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-                path = tmp.name
-
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            out    = cv2.VideoWriter(path, fourcc, fps, (w2, h2))
+            fps_i = max(1, min(30, int(round(fps))))
+            raw_chunks = []
             for fr in frames:
-                if w > 640:
-                    fr = cv2.resize(fr, (w2, h2))
-                out.write(fr)
-            out.release()
+                fr2 = fr if fr.shape[1] == w2 and fr.shape[0] == h2 else cv2.resize(fr, (w2, h2))
+                if not fr2.flags["C_CONTIGUOUS"]:
+                    fr2 = np.ascontiguousarray(fr2)
+                raw_chunks.append(fr2.tobytes())
+
+            fd, out_path = tempfile.mkstemp(suffix=".mp4")
+            os.close(fd)
+
+            cmd = [
+                "ffmpeg", "-y",
+                "-f", "rawvideo", "-vcodec", "rawvideo",
+                "-pix_fmt", "bgr24", "-s", f"{w2}x{h2}",
+                "-r", str(fps_i), "-i", "pipe:0",
+                "-an",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-profile:v", "baseline", "-level", "3.1",
+                "-vsync", "cfr", "-r", str(fps_i),
+                "-movflags", "+faststart",
+                out_path,
+            ]
+            result = subprocess.run(
+                cmd, input=b"".join(raw_chunks),
+                capture_output=True, timeout=120,
+            )
+            if result.returncode != 0:
+                log.warning(f"[Cam {state.id}] FFmpeg error: {result.stderr.decode()[:300]}")
+                return
+
+            if len(frames) > 1:
+                diff = float(np.mean(np.abs(
+                    frames[0].astype(np.int16) - frames[-1].astype(np.int16))))
+                log.info(f"[Cam {state.id}] Clip {len(frames)} frame, diff primo/ultimo: {diff:.1f}")
 
             zname = zone.get("name", f"Zona {zi+1}")
             ts    = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
             cap   = (f"🎥 <b>{state.name}</b> – <b>{zname}</b>\n"
                      f"⏰ {ts}\n"
-                     f"⏱ {len(frames)/fps:.0f}s di clip")
+                     f"⏱ {len(frames)/fps_i:.0f}s ({len(frames)} frame)")
 
-            with open(path, "rb") as f:
+            with open(out_path, "rb") as f:
                 video_bytes = f.read()
-            os.unlink(path)
 
             base = f"https://api.telegram.org/bot{tok}"
-            httpx.post(f"{base}/sendVideo",
-                       data={"chat_id": cid, "caption": cap,
-                             "parse_mode": "HTML", "supports_streaming": "true"},
+            r = httpx.post(f"{base}/sendVideo",
+                       data={"chat_id": cid, "caption": cap, "parse_mode": "HTML"},
                        files={"video": ("clip.mp4", video_bytes, "video/mp4")},
-                       timeout=60)
+                       timeout=120)
+            if r.status_code == 200:
+                log.info(f"[Cam {state.id}] Video inviato su Telegram ({len(video_bytes)//1024}KB)")
+            else:
+                log.warning(f"[Cam {state.id}] Telegram sendVideo error: {r.text[:200]}")
+
         except Exception as e:
-            log.warning(f"[Cam {state.id}] Clip Telegram error: {e}")
+            log.warning(f"[Cam {state.id}] Clip error: {e}")
+        finally:
+            if out_path and os.path.exists(out_path):
+                os.unlink(out_path)
 
     threading.Thread(target=_do, daemon=True).start()
 
@@ -473,8 +499,16 @@ def camera_worker(state: CameraState):
         interval = 1.0 / src_fps if is_file else 0
         last_t   = time.time()
 
-        # Buffer condiviso con il thread di analisi
-        buf = {"frame": None, "lock": threading.Lock(), "active": True}
+        import collections
+        process_interval = 1.0 / PROCESS_FPS
+        last_process_t   = 0.0
+        ring_maxlen      = max(1, int(65 * PROCESS_FPS))
+        buf = {
+            "frame": None,
+            "clip_ring": collections.deque(maxlen=ring_maxlen),
+            "lock": threading.Lock(),
+            "active": True,
+        }
         threading.Thread(target=motion_analysis_worker, args=(state, buf),
                          daemon=True).start()
 
@@ -495,9 +529,13 @@ def camera_worker(state: CameraState):
                 state.last_frame = jpg.tobytes()
                 state.last_raw   = frame
 
-            # Passa al thread analisi (sovrascrive se non ancora consumato)
-            with buf["lock"]:
-                buf["frame"] = frame.copy()
+            now = time.time()
+            if now - last_process_t >= process_interval:
+                fc = frame.copy()
+                with buf["lock"]:
+                    buf["frame"] = fc
+                    buf["clip_ring"].append((now, fc.copy()))
+                last_process_t = now
 
             if is_file and interval:
                 nt = last_t + interval
