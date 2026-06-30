@@ -246,11 +246,13 @@ def motion_analysis_worker(state: CameraState, buf: dict):
         for zi in list(zone_post.keys()):
             post = zone_post[zi]
             post["frames"].append(frame.copy())
-            if now_t >= post["until"]:
+            if len(post["frames"]) >= post["target"]:
                 all_frames = post["pre_frames"] + post["frames"]
-                _send_clip(state, zi, all_frames, post["fps"], post["zone"])
+                _send_clip(state, zi, all_frames, post["fps"], post["zone"],
+                           post["vid_before"], post["vid_after"])
                 del zone_post[zi]
-                log.info(f"[Cam {state.id}] Clip zona {zi} completata: {len(all_frames)} frame")
+                log.info(f"[Cam {state.id}] Clip zona {zi} completata: "
+                         f"{len(all_frames)} frame ({post['vid_before']+post['vid_after']}s)")
 
         for zi, zone in enumerate(state.zones):
             if not zone.get("enabled", True): continue
@@ -347,17 +349,27 @@ def motion_analysis_worker(state: CameraState, buf: dict):
                 if not send_video:
                     tg_send(msg, snap if tg_cfg.get("send_photo", True) else None, tok, cid)
                 elif zi not in zone_post:
-                    cutoff = now_t - vid_before
+                    n_pre  = max(1, int(vid_before * analysis_fps))
+                    n_post = max(1, int(vid_after  * analysis_fps))
                     with buf["lock"]:
-                        pre_frames = [f for t, f in buf["clip_ring"] if t >= cutoff]
+                        ring_frames = [f for _, f in buf["clip_ring"]]
+                    if len(ring_frames) >= n_pre:
+                        pre_frames = ring_frames[-n_pre:]
+                    elif ring_frames:
+                        pre_frames = [ring_frames[0]] * (n_pre - len(ring_frames)) + ring_frames
+                    else:
+                        pre_frames = [frame.copy()] * n_pre
                     zone_post[zi] = {
                         "frames":     [],
                         "pre_frames": pre_frames,
-                        "until":      now_t + vid_after,
+                        "target":     n_post,
                         "fps":        float(analysis_fps),
                         "zone":       zone,
+                        "vid_before": vid_before,
+                        "vid_after":  vid_after,
                     }
-                    log.info(f"[Cam {state.id}] Avvio clip zona {zi}: {len(pre_frames)} pre-frame, {vid_after}s post")
+                    log.info(f"[Cam {state.id}] Avvio clip zona {zi}: "
+                             f"{n_pre}+{n_post} frame ({vid_before}+{vid_after}s)")
 
             state.record_zone_hit(zname)
             esc_msg = state.check_escalation(zone.get("escalation", []))
@@ -367,7 +379,8 @@ def motion_analysis_worker(state: CameraState, buf: dict):
 
 
 def _send_clip(state: CameraState, zi: int, frames: list,
-               fps: float, zone: dict):
+               fps: float, zone: dict,
+               vid_before: int = 10, vid_after: int = 10):
     """Assembla i frame in MP4 H.264 via FFmpeg e manda su Telegram."""
     if not frames:
         return
@@ -433,9 +446,10 @@ def _send_clip(state: CameraState, zi: int, frames: list,
 
             zname = zone.get("name", f"Zona {zi+1}")
             ts    = datetime.now().strftime("%H:%M:%S %d/%m/%Y")
+            total_sec = int(vid_before) + int(vid_after)
             cap   = (f"🎥 <b>{state.name}</b> – <b>{zname}</b>\n"
                      f"⏰ {ts}\n"
-                     f"⏱ {len(frames)/fps_i:.0f}s ({len(frames)} frame)")
+                     f"⏱ {total_sec}s ({vid_before}s prima + {vid_after}s dopo)")
 
             with open(out_path, "rb") as f:
                 video_bytes = f.read()
